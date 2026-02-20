@@ -1,0 +1,141 @@
+{
+  "title": "LLM Inference Stack",
+  "uid": "llm-stack-001",
+  "schemaVersion": 38,
+  "refresh": "5s",
+  "time": { "from": "now-30m", "to": "now" },
+  "panels": [
+    {
+      "id": 1, "type": "stat", "title": "Active Requests",
+      "gridPos": { "x": 0, "y": 0, "w": 4, "h": 4 },
+      "targets": [{ "expr": "gateway_active_requests", "legendFormat": "active" }],
+      "options": { "colorMode": "background", "graphMode": "area" }
+    },
+    {
+      "id": 2, "type": "stat", "title": "Requests/sec",
+      "gridPos": { "x": 4, "y": 0, "w": 4, "h": 4 },
+      "targets": [{ "expr": "rate(gateway_requests_total[1m])", "legendFormat": "req/s" }]
+    },
+    {
+      "id": 3, "type": "stat", "title": "KV Cache %",
+      "gridPos": { "x": 8, "y": 0, "w": 4, "h": 4 },
+      "targets": [{ "expr": "vllm:gpu_cache_usage_perc * 100", "legendFormat": "KV cache %" }],
+      "options": { "colorMode": "background" },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 75 },
+              { "color": "red", "value": 90 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 4, "type": "stat", "title": "Queue Depth",
+      "gridPos": { "x": 12, "y": 0, "w": 4, "h": 4 },
+      "targets": [{ "expr": "vllm:num_requests_waiting", "legendFormat": "waiting" }],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 10 },
+              { "color": "red", "value": 50 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 5, "type": "stat", "title": "Agg Tokens/sec",
+      "gridPos": { "x": 16, "y": 0, "w": 4, "h": 4 },
+      "targets": [{ "expr": "rate(gateway_tokens_generated_total[1m])", "legendFormat": "tok/s" }]
+    },
+    {
+      "id": 10, "type": "timeseries", "title": "Request Latency Percentiles",
+      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, rate(gateway_request_duration_seconds_bucket[5m]))", "legendFormat": "P50" },
+        { "expr": "histogram_quantile(0.95, rate(gateway_request_duration_seconds_bucket[5m]))", "legendFormat": "P95" },
+        { "expr": "histogram_quantile(0.99, rate(gateway_request_duration_seconds_bucket[5m]))", "legendFormat": "P99" }
+      ]
+    },
+    {
+      "id": 11, "type": "timeseries", "title": "Time to First Token",
+      "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, rate(gateway_time_to_first_token_seconds_bucket[5m]))", "legendFormat": "P50" },
+        { "expr": "histogram_quantile(0.95, rate(gateway_time_to_first_token_seconds_bucket[5m]))", "legendFormat": "P95" },
+        { "expr": "histogram_quantile(0.99, rate(gateway_time_to_first_token_seconds_bucket[5m]))", "legendFormat": "P99" }
+      ]
+    },
+    {
+      "id": 20, "type": "timeseries", "title": "GPU Utilization %",
+      "gridPos": { "x": 0, "y": 12, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "gpu_utilization_percent", "legendFormat": "{{gpu_id}}" }
+      ]
+    },
+    {
+      "id": 21, "type": "timeseries", "title": "GPU Memory (MiB)",
+      "gridPos": { "x": 12, "y": 12, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "gpu_memory_used_mib", "legendFormat": "{{gpu_id}} used" },
+        { "expr": "gpu_memory_total_mib - gpu_memory_used_mib", "legendFormat": "{{gpu_id}} free" }
+      ]
+    },
+    {
+      "id": 22, "type": "timeseries", "title": "GPU Power Draw (W)",
+      "gridPos": { "x": 0, "y": 20, "w": 8, "h": 6 },
+      "targets": [
+        { "expr": "gpu_power_draw_watts", "legendFormat": "{{gpu_id}}" },
+        { "expr": "gpu_power_limit_watts", "legendFormat": "{{gpu_id}} limit" }
+      ]
+    },
+    {
+      "id": 23, "type": "timeseries", "title": "GPU Temperature (°C)",
+      "gridPos": { "x": 8, "y": 20, "w": 8, "h": 6 },
+      "targets": [{ "expr": "gpu_temperature_celsius", "legendFormat": "{{gpu_id}}" }]
+    },
+    {
+      "id": 24, "type": "timeseries", "title": "SM Clock (MHz)",
+      "gridPos": { "x": 16, "y": 20, "w": 8, "h": 6 },
+      "targets": [{ "expr": "gpu_sm_clock_mhz", "legendFormat": "{{gpu_id}}" }]
+    },
+    {
+      "id": 30, "type": "timeseries", "title": "vLLM KV Cache Utilization",
+      "gridPos": { "x": 0, "y": 26, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "vllm:gpu_cache_usage_perc", "legendFormat": "GPU KV cache" },
+        { "expr": "vllm:cpu_cache_usage_perc", "legendFormat": "CPU swap" }
+      ]
+    },
+    {
+      "id": 31, "type": "timeseries", "title": "vLLM Running / Waiting / Swapped",
+      "gridPos": { "x": 12, "y": 26, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "vllm:num_requests_running", "legendFormat": "running" },
+        { "expr": "vllm:num_requests_waiting", "legendFormat": "waiting" },
+        { "expr": "vllm:num_requests_swapped", "legendFormat": "swapped" }
+      ]
+    },
+    {
+      "id": 40, "type": "timeseries", "title": "Gateway Errors by Status Code",
+      "gridPos": { "x": 0, "y": 34, "w": 12, "h": 6 },
+      "targets": [
+        { "expr": "rate(gateway_requests_total{status_code=~'4..|5..'}[2m])", "legendFormat": "{{status_code}}" }
+      ]
+    },
+    {
+      "id": 41, "type": "timeseries", "title": "Auth Failures & Rate Limits",
+      "gridPos": { "x": 12, "y": 34, "w": 12, "h": 6 },
+      "targets": [
+        { "expr": "rate(gateway_auth_failures_total[2m])", "legendFormat": "auth failures" },
+        { "expr": "rate(gateway_rate_limited_total[2m])", "legendFormat": "rate limited" }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+# API gateway (no GPU required)
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:$PATH"
+
+WORKDIR /app
+COPY pyproject.toml .
+
+RUN uv pip install --system \
+    fastapi==0.115.6 \
+    "uvicorn[standard]==0.32.1" \
+    "httpx[http2]==0.28.1" \
+    prometheus-client==0.21.1 \
+    structlog==24.4.0 \
+    slowapi==0.1.9 \
+    pydantic==2.10.3 \
+    pydantic-settings==2.7.0 \
+    python-dotenv==1.0.1
+
+COPY gateway/ /app/gateway/
+
+RUN useradd -m -u 1000 gateway
+USER gateway
+
+EXPOSE 8080
+CMD ["python3", "-m", "gateway.server"]

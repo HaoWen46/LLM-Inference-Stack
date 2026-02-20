@@ -1,0 +1,28 @@
+[project]
+name = "llm-stack"
+version = "0.1.0"
+description = "Production LLM inference stack"
+requires-python = ">=3.10"
+dependencies = [
+    "vllm==0.6.6",
+    "fastapi==0.115.6",
+    "uvicorn[standard]==0.32.1",
+    "httpx[http2]==0.28.1",
+    "prometheus-client==0.21.1",
+    "structlog==24.4.0",
+    "slowapi==0.1.9",
+    "pydantic==2.10.3",
+    "pydantic-settings==2.7.0",
+    "python-dotenv==1.0.1",
+    "numpy==1.26.4",
+    "aiofiles==24.1.0",
+    "rich==13.9.4",
+    "typer==0.15.1",
+]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "httpx>=0.28",
+]

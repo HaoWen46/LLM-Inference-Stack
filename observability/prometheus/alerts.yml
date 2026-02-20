@@ -1,0 +1,106 @@
+groups:
+  - name: vllm_kv_cache
+    rules:
+      - alert: KVCachePressureWarning
+        expr: vllm:gpu_cache_usage_perc > 0.85
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "KV cache above 85% on {{ $labels.instance }}"
+          description: "Current: {{ $value | humanizePercentage }}"
+
+      - alert: KVCachePressureCritical
+        expr: vllm:gpu_cache_usage_perc > 0.95
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "KV cache above 95% — preemptions likely"
+
+      - alert: RequestsBeingSwapped
+        expr: vllm:num_requests_swapped > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "vLLM is swapping KV blocks to CPU"
+
+  - name: vllm_latency
+    rules:
+      - alert: HighP99Latency
+        expr: >
+          histogram_quantile(0.99,
+            rate(vllm:e2e_request_latency_seconds_bucket[5m])
+          ) > 60
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "P99 end-to-end latency > 60s"
+
+      - alert: HighTTFTP95
+        expr: >
+          histogram_quantile(0.95,
+            rate(vllm:time_to_first_token_seconds_bucket[5m])
+          ) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "P95 TTFT > 10s — prefill queue likely backed up"
+
+  - name: vllm_queue
+    rules:
+      - alert: HighQueueDepth
+        expr: vllm:num_requests_waiting > 50
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} requests waiting in vLLM queue"
+
+  - name: gpu_health
+    rules:
+      - alert: GPUMemoryLow
+        expr: gpu_memory_free_mib < 2000
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "GPU {{ $labels.gpu_id }} has < 2GB free memory"
+
+      - alert: GPUHighTemperature
+        expr: gpu_temperature_celsius > 85
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "GPU {{ $labels.gpu_id }} temperature {{ $value }}°C"
+
+      - alert: GPUUncorrectedECC
+        expr: increase(gpu_ecc_errors_uncorrected_total[10m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Uncorrected ECC errors on {{ $labels.gpu_id }} — hardware fault"
+
+      - alert: GPUPowerCapHit
+        expr: (gpu_power_draw_watts / gpu_power_limit_watts) > 0.98
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "GPU {{ $labels.gpu_id }} at power cap — may throttle"
+
+  - name: gateway
+    rules:
+      - alert: GatewayHighErrorRate
+        expr: >
+          rate(gateway_requests_total{status_code=~"5.."}[5m])
+          / rate(gateway_requests_total[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Gateway error rate > 5%"

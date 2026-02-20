@@ -1,0 +1,39 @@
+# vLLM inference server
+# Build: docker build -f docker/Dockerfile.vllm -t llm-vllm:latest .
+FROM nvidia/cuda:12.9.0-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y \
+    python3.11 python3.11-dev python3-pip \
+    git curl wget \
+    libopenblas-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 \
+ && update-alternatives --install /usr/bin/python python python3.11 1
+
+# Install uv
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:$PATH"
+
+WORKDIR /app
+COPY pyproject.toml .
+
+# Install deps into the system python (no venv needed in container)
+RUN uv pip install --system vllm==0.6.6 huggingface_hub prometheus-client
+
+# Non-root user
+RUN useradd -m -u 1000 vllm
+USER vllm
+
+ENV HF_HOME=/model-cache
+ENV TRANSFORMERS_CACHE=/model-cache
+ENV TRITON_CACHE_DIR=/triton-cache
+
+EXPOSE 8000
+
+COPY --chown=vllm:vllm scripts/launch_vllm.sh /app/launch_vllm.sh
+RUN chmod +x /app/launch_vllm.sh
+
+# The config/.env is bind-mounted at runtime
+ENTRYPOINT ["/app/launch_vllm.sh"]

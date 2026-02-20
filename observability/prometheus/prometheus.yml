@@ -1,0 +1,30 @@
+global:
+  scrape_interval:     5s
+  evaluation_interval: 5s
+  external_labels:
+    instance: llm-server
+
+rule_files:
+  - "alerts.yml"
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []  # add alertmanager host:port here
+
+scrape_configs:
+  - job_name: vllm
+    static_configs:
+      - targets: ["host.docker.internal:8000"]
+    metrics_path: /metrics
+
+  - job_name: gateway
+    static_configs:
+      - targets: ["host.docker.internal:8080"]
+    metrics_path: /metrics
+
+  - job_name: gpu
+    static_configs:
+      - targets: ["host.docker.internal:9101"]
+    metrics_path: /metrics
+    scrape_interval: 2s   # GPU metrics need higher resolution
