@@ -1,37 +1,36 @@
 ## LLM Stack — top-level Makefile
 ##
 ## Usage:
-##   make setup        — create .env and install deps
-##   make download     — pull model weights
-##   make vllm         — start vLLM server
-##   make gateway      — start API gateway
-##   make gpu-exporter — start GPU Prometheus exporter
-##   make monitoring   — start Prometheus + Grafana via docker-compose
-##   make loadtest     — run load test against gateway
-##   make status       — show running processes and GPU state
-##   make stop         — stop all background processes
+##   make setup         — install Python deps with uv
+##   make download      — pull model weights
+##   make vllm          — start vLLM server
+##   make gateway       — start Rust gateway (builds first)
+##   make gpu-exporter  — start Rust GPU Prometheus exporter
+##   make build-rust    — compile both Rust crates (release)
+##   make monitoring    — start Prometheus + Grafana + Jaeger + Loki via docker-compose
+##   make loadtest      — run load test against gateway
+##   make status        — show running processes and GPU state
+##   make stop          — gracefully stop all background processes
+##   make logs          — tail Loki + Promtail container logs
 
 SHELL     := bash
 ROOT_DIR  := $(shell pwd)
-VENV      := $(ROOT_DIR)/.venv
-PYTHON    := $(VENV)/bin/python3
-UV        := $(shell which uv || echo $(HOME)/.local/bin/uv)
+UV        := $(shell which uv 2>/dev/null || echo $(HOME)/.local/bin/uv)
 ENV_FILE  := $(ROOT_DIR)/config/.env
+CARGO     := cargo
+RUST_MANIFEST := $(ROOT_DIR)/rust/Cargo.toml
 
-.PHONY: help setup download vllm gateway gpu-exporter monitoring loadtest status stop
+.PHONY: help setup download vllm gateway gpu-exporter build-rust \
+        monitoring monitoring-down loadtest status stop logs
 
 help:
 	@grep -E '^## ' Makefile | sed 's/## //'
 
-# ── Setup ──────────────────────────────────────────────────────────────────
-setup: $(VENV)/bin/activate config/.env
-
-$(VENV)/bin/activate: pyproject.toml
-	@echo "[setup] Creating venv and installing deps..."
-	$(UV) venv --python 3.10 $(VENV)
-	$(UV) pip install --python $(PYTHON) -r pyproject.toml
-	@touch $(VENV)/bin/activate
-	@echo "[setup] Done. Activate with: source .venv/bin/activate"
+# ── Setup (Python deps via uv) ──────────────────────────────────────────────
+setup: config/.env
+	@echo "[setup] Installing Python deps with uv..."
+	$(UV) sync
+	@echo "[setup] Done. Run 'source .venv/bin/activate' or prefix commands with 'uv run'."
 
 config/.env:
 	@echo "[setup] Creating config/.env from example..."
@@ -42,35 +41,40 @@ config/.env:
 download:
 	@bash scripts/download_model.sh
 
-# ── vLLM server (runs in foreground — use tmux or & for background) ────────
+# ── vLLM server ────────────────────────────────────────────────────────────
 vllm:
 	@bash scripts/launch_vllm.sh
 
-# ── API Gateway ────────────────────────────────────────────────────────────
+# ── Rust gateway (builds then runs) ────────────────────────────────────────
 gateway:
 	@source $(ENV_FILE) && \
-	  source $(VENV)/bin/activate && \
-	  PYTHONPATH=$(ROOT_DIR) $(PYTHON) -m gateway.server
+	  $(CARGO) run --manifest-path $(RUST_MANIFEST) -p gateway --release
 
-# ── GPU metrics exporter ───────────────────────────────────────────────────
+# ── Rust GPU exporter ───────────────────────────────────────────────────────
 gpu-exporter:
-	@source $(VENV)/bin/activate && \
-	  $(PYTHON) scripts/gpu_exporter.py
+	@source $(ENV_FILE) && \
+	  $(CARGO) run --manifest-path $(RUST_MANIFEST) -p gpu-exporter --release
 
-# ── Monitoring stack (Prometheus + Grafana) ────────────────────────────────
+# ── Build both Rust crates ──────────────────────────────────────────────────
+build-rust:
+	$(CARGO) build --manifest-path $(RUST_MANIFEST) --release
+	@echo "[build-rust] Binaries at rust/target/release/{gateway,gpu-exporter}"
+
+# ── Monitoring stack ────────────────────────────────────────────────────────
 monitoring:
-	@docker compose -f docker/docker-compose.yml up -d prometheus grafana
+	@docker compose -f docker/docker-compose.yml up -d prometheus grafana jaeger loki promtail
 	@echo "Prometheus: http://localhost:9090"
 	@echo "Grafana:    http://localhost:3000  (admin / admin)"
+	@echo "Jaeger UI:  http://localhost:16686"
+	@echo "Loki:       http://localhost:3100"
 
 monitoring-down:
 	@docker compose -f docker/docker-compose.yml down
 
 # ── Load test ──────────────────────────────────────────────────────────────
 loadtest:
-	@source $(VENV)/bin/activate && \
-	  source $(ENV_FILE) && \
-	  PYTHONPATH=$(ROOT_DIR) $(PYTHON) loadtest/runner.py \
+	@source $(ENV_FILE) && \
+	  $(UV) run loadtest/runner.py \
 	    --url http://localhost:8080 \
 	    --key $$(echo $$GATEWAY_API_KEYS | cut -d, -f1) \
 	    --model $$SERVED_MODEL_NAME \
@@ -79,16 +83,28 @@ loadtest:
 
 # ── Status ─────────────────────────────────────────────────────────────────
 status:
-	@echo "=== GPU ===" && nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.free,temperature.gpu,power.draw --format=csv,noheader
+	@echo "=== GPU ===" && nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.free,temperature.gpu,power.draw --format=csv,noheader 2>/dev/null || echo "  (no GPU)"
 	@echo ""
-	@echo "=== Processes ===" && ps aux | grep -E 'vllm|gateway|gpu_exporter' | grep -v grep || true
+	@echo "=== Processes ===" && ps aux | grep -E 'vllm|gateway|gpu.exporter' | grep -v grep || true
 	@echo ""
 	@echo "=== vLLM health ===" && curl -sf http://localhost:8000/health && echo " OK" || echo " DOWN"
 	@echo "=== Gateway health ===" && curl -sf http://localhost:8080/health && echo " OK" || echo " DOWN"
+	@echo "=== GPU exporter ===" && curl -sf http://localhost:9101/health && echo " OK" || echo " DOWN"
 
-# ── Stop all ───────────────────────────────────────────────────────────────
+# ── Stop all (SIGTERM → 35s → SIGKILL) ────────────────────────────────────
 stop:
-	@pkill -f 'vllm.entrypoints' || true
-	@pkill -f 'gateway.server'   || true
-	@pkill -f 'gpu_exporter'     || true
+	@echo "Sending SIGTERM to gateway..."
+	@pkill -SIGTERM -f 'target/release/gateway' || true
+	@echo "Sending SIGTERM to vLLM..."
+	@pkill -SIGTERM -f 'vllm.entrypoints' || true
+	@pkill -SIGTERM -f 'target/release/gpu-exporter' || true
+	@echo "Waiting up to 35s for graceful shutdown..."
+	@sleep 35
+	@pkill -9 -f 'vllm.entrypoints'         2>/dev/null || true
+	@pkill -9 -f 'target/release/gateway'   2>/dev/null || true
+	@pkill -9 -f 'target/release/gpu-exporter' 2>/dev/null || true
 	@echo "Stopped."
+
+# ── Log tailing ────────────────────────────────────────────────────────────
+logs:
+	@docker compose -f docker/docker-compose.yml logs -f loki promtail

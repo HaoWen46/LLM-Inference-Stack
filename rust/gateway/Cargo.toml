@@ -1,0 +1,35 @@
+[package]
+name = "gateway"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "gateway"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.7", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["trace", "cors", "request-id"] }
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+prometheus-client = "0.22"
+governor = { version = "0.6", features = ["dashmap"] }
+sqlx = { version = "0.7", features = ["sqlite", "runtime-tokio-rustls", "macros"] }
+sha2 = "0.10"
+dashmap = "5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+opentelemetry = "0.26"
+opentelemetry-otlp = { version = "0.26", features = ["grpc-tonic"] }
+opentelemetry_sdk = { version = "0.26", features = ["rt-tokio"] }
+tracing-opentelemetry = "0.27"
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+thiserror = "1"
+bytes = "1"
+futures = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
+chrono = { version = "0.4", features = ["now"] }

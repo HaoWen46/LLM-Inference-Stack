@@ -15,17 +15,20 @@ x-logging: &default-logging
 
 services:
 
-  # ── Gateway ───────────────────────────────────────────────────────────────
+  # ── Gateway (Rust/Axum) ───────────────────────────────────────────────────
   gateway:
     build:
       context: ..
-      dockerfile: docker/Dockerfile.gateway
+      dockerfile: docker/Dockerfile.gateway-rust
     ports:
       - "8080:8080"
     env_file:
       - ../config/.env
     environment:
       VLLM_URL: "http://host.docker.internal:8000"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4317"
+    volumes:
+      - gateway_data:/app/data
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
@@ -36,6 +39,43 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
+    depends_on:
+      - jaeger
+
+  # ── GPU Metrics Exporter (Rust) ───────────────────────────────────────────
+  gpu-exporter:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.gpu-exporter-rust
+    ports:
+      - "9101:9101"
+    environment:
+      GPU_EXPORTER_PORT: "9101"
+    # nvidia-smi access — requires host nvidia driver
+    volumes:
+      - /usr/bin/nvidia-smi:/usr/bin/nvidia-smi:ro
+    devices:
+      - /dev/nvidiactl:/dev/nvidiactl
+    restart: unless-stopped
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9101/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  # ── Jaeger (all-in-one) ───────────────────────────────────────────────────
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "4317:4317"     # OTLP gRPC
+      - "4318:4318"     # OTLP HTTP
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    restart: unless-stopped
+    logging: *default-logging
 
   # ── Prometheus ────────────────────────────────────────────────────────────
   prometheus:
@@ -71,9 +111,38 @@ services:
       GF_USERS_ALLOW_SIGN_UP: "false"
     depends_on:
       - prometheus
+      - loki
+    restart: unless-stopped
+    logging: *default-logging
+
+  # ── Loki (log aggregation) ────────────────────────────────────────────────
+  loki:
+    image: grafana/loki:3.2.0
+    ports:
+      - "3100:3100"
+    volumes:
+      - ../observability/loki:/etc/loki:ro
+      - loki_data:/loki
+    command: -config.file=/etc/loki/loki-config.yml
+    restart: unless-stopped
+    logging: *default-logging
+
+  # ── Promtail (log shipper) ────────────────────────────────────────────────
+  promtail:
+    image: grafana/promtail:3.2.0
+    volumes:
+      - ../observability/promtail:/etc/promtail:ro
+      - gateway_data:/app/data:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: -config.file=/etc/promtail/promtail-config.yml
+    depends_on:
+      - loki
     restart: unless-stopped
     logging: *default-logging
 
 volumes:
   prometheus_data:
   grafana_data:
+  loki_data:
+  gateway_data:

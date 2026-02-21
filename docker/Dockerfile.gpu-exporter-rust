@@ -1,0 +1,47 @@
+# syntax=docker/dockerfile:1
+# ── Stage 1: build ────────────────────────────────────────────────────────────
+FROM rust:1.82-slim AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Cache dependency compilation
+COPY rust/Cargo.toml rust/Cargo.lock ./
+COPY rust/gateway/Cargo.toml gateway/
+COPY rust/gpu-exporter/Cargo.toml gpu-exporter/
+
+RUN mkdir -p gateway/src gpu-exporter/src \
+    && echo 'fn main() {}' > gateway/src/main.rs \
+    && echo 'fn main() {}' > gpu-exporter/src/main.rs \
+    && cargo build --release -p gpu-exporter 2>/dev/null || true \
+    && rm -rf gateway/src gpu-exporter/src
+
+COPY rust/gpu-exporter/src gpu-exporter/src
+RUN touch gpu-exporter/src/main.rs \
+    && cargo build --release -p gpu-exporter
+
+# ── Stage 2: runtime ──────────────────────────────────────────────────────────
+FROM debian:bookworm-slim
+
+# nvidia-smi must be available on the host and bind-mounted or installed
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /build/target/release/gpu-exporter /app/gpu-exporter
+
+RUN useradd -r -s /bin/false gpu-exporter \
+    && chown -R gpu-exporter:gpu-exporter /app
+USER gpu-exporter
+
+EXPOSE 9101
+
+HEALTHCHECK --interval=10s --timeout=5s --start-period=5s --retries=3 \
+    CMD curl -sf http://localhost:9101/health || exit 1
+
+ENTRYPOINT ["/app/gpu-exporter"]

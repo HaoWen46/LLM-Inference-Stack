@@ -1,0 +1,53 @@
+# syntax=docker/dockerfile:1
+# ── Stage 1: build ────────────────────────────────────────────────────────────
+FROM rust:1.82-slim AS builder
+
+# Install build dependencies (for sqlx native-tls / openssl)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config libssl-dev cmake ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Cache dependency compilation separately from source
+COPY rust/Cargo.toml rust/Cargo.lock ./
+COPY rust/gateway/Cargo.toml gateway/
+COPY rust/gpu-exporter/Cargo.toml gpu-exporter/
+
+# Create dummy source files so Cargo can compile dependencies
+RUN mkdir -p gateway/src gpu-exporter/src \
+    && echo 'fn main() {}' > gateway/src/main.rs \
+    && echo 'fn main() {}' > gpu-exporter/src/main.rs \
+    && cargo build --release -p gateway 2>/dev/null || true \
+    && rm -rf gateway/src gpu-exporter/src
+
+# Now copy real sources and compile
+COPY rust/gateway/src gateway/src
+RUN touch gateway/src/main.rs \
+    && cargo build --release -p gateway
+
+# ── Stage 2: runtime ──────────────────────────────────────────────────────────
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create data directory for SQLite usage DB
+RUN mkdir -p /app/data
+
+WORKDIR /app
+
+COPY --from=builder /build/target/release/gateway /app/gateway
+
+# Non-root user for security
+RUN useradd -r -s /bin/false gateway \
+    && chown -R gateway:gateway /app
+USER gateway
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=10s --timeout=5s --start-period=15s --retries=3 \
+    CMD curl -sf http://localhost:8080/health || exit 1
+
+ENTRYPOINT ["/app/gateway"]
