@@ -1,0 +1,10 @@
+# Tell GitHub Linguist to detect and count Rust source files.
+# Without this, large JSON/YAML files in observability/ can drown out
+# the Rust percentage, or Linguist may treat the rust/ tree as vendored.
+rust/**.rs linguist-detectable=true
+rust/**.toml linguist-detectable=true
+
+# Exclude generated / data files from language stats
+observability/grafana/dashboards/*.json linguist-generated=true
+observability/**/*.yml linguist-documentation=true
+config/.env.example linguist-documentation=true
