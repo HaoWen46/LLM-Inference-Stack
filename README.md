@@ -2,7 +2,7 @@
 
 Production-grade LLM serving on 2x NVIDIA RTX A6000 (48GB each).
 
-Built on [vLLM](https://github.com/vllm-project/vllm) with a FastAPI gateway, Prometheus metrics, and Grafana dashboards.
+Built on [vLLM](https://github.com/vllm-project/vllm) with a **Rust/Axum gateway**, Prometheus metrics, and Grafana dashboards.
 
 ## Architecture
 
@@ -13,7 +13,7 @@ Client
 NGINX  (TLS termination, optional)
   │
   ▼
-Gateway :8080  (auth, rate-limit, logging, metrics)
+Gateway :8080  (Rust/Axum — auth, rate-limit, quota, circuit breaker, metrics)
   │
   ▼
 vLLM   :8000  (inference, KV cache, tensor parallelism)
@@ -22,8 +22,25 @@ vLLM   :8000  (inference, KV cache, tensor parallelism)
   └── GPU 1  RTX A6000 48GB
 
 Sidecar processes
-  gpu_exporter  :9101  →  Prometheus :9090  →  Grafana :3000
+  gpu-exporter :9101  →  Prometheus :9090  →  Grafana :3000
+  (Rust binary — polls nvidia-smi every 2s)
 ```
+
+## Stack
+
+| Component | Language | Purpose |
+|-----------|----------|---------|
+| vLLM 0.6.6 | Python | Inference engine — paged attention, continuous batching, tensor parallelism |
+| **Axum 0.7** | **Rust** | **API gateway — zero-GC, predictable tail latency** |
+| **governor** | **Rust** | **Per-IP GCRA rate limiting** |
+| **sqlx + DashMap** | **Rust** | **Per-key daily token quota (SQLite backend)** |
+| **prometheus-client** | **Rust** | **Metrics exposition** |
+| Prometheus 2.55 | — | Metrics storage |
+| Grafana 11.3 | — | Dashboards and alerting |
+| Jaeger | — | Distributed tracing (OpenTelemetry OTLP) |
+| Loki + Promtail | — | Log aggregation |
+
+The Python FastAPI gateway (`gateway/`) is kept as a reference implementation and fallback.
 
 ## Hardware requirements
 
@@ -35,28 +52,19 @@ Sidecar processes
 | OS | Ubuntu 22.04 |
 | CUDA | 12.x |
 
-## Stack
-
-| Component | Purpose |
-|-----------|---------|
-| vLLM 0.6.6 | Inference engine — paged attention, continuous batching, tensor parallelism |
-| FastAPI + uvicorn | Async API gateway |
-| slowapi | Per-IP rate limiting |
-| structlog | Structured JSON logging |
-| prometheus-client | Metrics exposition |
-| Prometheus 2.55 | Metrics storage |
-| Grafana 11.3 | Dashboards and alerting |
-
 ## Quickstart
 
 ### 1. Install dependencies
 
 ```bash
-# Install uv (if not already installed)
+# Install uv (fast Python package manager)
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Create venv and install all packages
+# Install Python deps (vLLM, load tester)
 make setup
+
+# Install Rust (for gateway + gpu-exporter)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
 ### 2. Configure
@@ -109,12 +117,14 @@ Open three terminal panes (or use tmux):
 # Pane 1 — inference engine
 make vllm
 
-# Pane 2 — API gateway
+# Pane 2 — API gateway (Rust; builds on first run)
 make gateway
 
-# Pane 3 — GPU metrics exporter
+# Pane 3 — GPU metrics exporter (Rust)
 make gpu-exporter
 ```
+
+The first `make gateway` invocation compiles the Rust binary (`~60s`). Subsequent runs start in milliseconds.
 
 ### 5. Start monitoring
 
@@ -124,6 +134,7 @@ Requires Docker for Prometheus + Grafana:
 make monitoring
 # Prometheus → http://localhost:9090
 # Grafana    → http://localhost:3000   (admin / admin)
+# Jaeger UI  → http://localhost:16686
 ```
 
 The Grafana dashboard auto-provisions on first start.
@@ -154,6 +165,10 @@ curl http://localhost:8080/v1/chat/completions \
     "messages": [{"role": "user", "content": "Hello"}],
     "max_tokens": 64
   }'
+
+# Per-key usage
+curl http://localhost:8080/v1/usage \
+  -H "Authorization: Bearer dev-key-1"
 ```
 
 ### 7. Load test
@@ -171,50 +186,96 @@ Outputs live stats (req/s, P50/P95/P99 latency, TTFT) and a final report broken 
 ```
 .
 ├── config/
-│   ├── .env               ← your local config (gitignored)
-│   └── .env.example       ← template
-├── gateway/
-│   ├── app.py             ← FastAPI app: proxy, streaming, auth, metrics
-│   ├── auth.py            ← Bearer / x-api-key validation
-│   ├── config.py          ← pydantic-settings from .env
-│   ├── logging_config.py  ← structlog JSON setup
-│   ├── metrics.py         ← Prometheus metrics definitions
-│   └── server.py          ← uvicorn entrypoint
+│   ├── .env                  ← your local config (gitignored)
+│   └── .env.example          ← template
+│
+├── rust/                     ← Rust workspace (gateway + gpu-exporter)
+│   ├── Cargo.toml            ← workspace root
+│   ├── gateway/
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── main.rs       ← router, warmup, graceful shutdown
+│   │       ├── config.rs     ← Config::from_env()
+│   │       ├── auth.rs       ← ApiKey extractor (Bearer + x-api-key)
+│   │       ├── rate_limiter.rs ← DashMap<IpAddr, governor::RateLimiter>
+│   │       ├── circuit_breaker.rs ← lockless atomics (no Mutex)
+│   │       ├── quota.rs      ← DashMap cache + SQLite flush every 10s
+│   │       ├── metrics.rs    ← prometheus-client Registry
+│   │       ├── proxy.rs      ← sync + SSE streaming proxy, TTFT
+│   │       ├── error.rs      ← GatewayError → HTTP status mapping
+│   │       └── tracing_setup.rs ← tracing-subscriber JSON + OTel OTLP
+│   └── gpu-exporter/
+│       ├── Cargo.toml
+│       └── src/
+│           └── main.rs       ← nvidia-smi polling, /metrics, /health
+│
+├── gateway/                  ← Python gateway (reference / fallback)
+│   ├── app.py                ← FastAPI app: proxy, streaming, auth, metrics
+│   ├── auth.py
+│   ├── circuit_breaker.py
+│   ├── config.py
+│   ├── logging_config.py
+│   ├── metrics.py
+│   ├── server.py
+│   └── usage_db.py
+│
 ├── scripts/
-│   ├── launch_vllm.sh     ← starts vLLM with settings from .env
-│   ├── download_model.sh  ← huggingface_hub snapshot_download
-│   ├── gpu_exporter.py    ← nvidia-smi → Prometheus on :9101
-│   └── watchdog.py        ← process supervisor with health checks
+│   ├── launch_vllm.sh        ← starts vLLM with settings from .env
+│   ├── download_model.sh     ← huggingface_hub snapshot_download
+│   ├── gpu_exporter.py       ← Python GPU exporter (replaced by Rust)
+│   └── watchdog.py           ← process supervisor with health checks
+│
 ├── loadtest/
-│   └── runner.py          ← async load driver, rich live output, percentile report
+│   └── runner.py             ← async load driver, rich live output, percentile report
+│
 ├── observability/
 │   ├── prometheus/
-│   │   ├── prometheus.yml ← scrape config (vLLM + gateway + GPU exporter)
-│   │   └── alerts.yml     ← KV cache pressure, latency, ECC, queue depth
-│   └── grafana/
-│       ├── dashboards/    ← auto-provisioned LLM stack dashboard
-│       └── provisioning/  ← datasource + dashboard provider config
+│   │   ├── prometheus.yml    ← scrape config (vLLM + gateway + GPU exporter)
+│   │   └── alerts.yml        ← KV cache pressure, latency, ECC, queue depth
+│   ├── grafana/
+│   │   ├── dashboards/       ← auto-provisioned LLM stack dashboard
+│   │   └── provisioning/     ← datasource + dashboard provider config
+│   ├── loki/                 ← Loki log aggregation config
+│   └── promtail/             ← Promtail log shipper config
+│
 ├── docker/
+│   ├── Dockerfile.gateway-rust     ← multi-stage Rust build (~30MB image)
+│   ├── Dockerfile.gpu-exporter-rust
+│   ├── Dockerfile.gateway          ← Python gateway (fallback)
 │   ├── Dockerfile.vllm
-│   ├── Dockerfile.gateway
-│   └── docker-compose.yml ← gateway + Prometheus + Grafana
+│   └── docker-compose.yml          ← full stack
+│
 ├── pyproject.toml
-└── Makefile               ← setup / download / vllm / gateway / loadtest / status / stop
+└── Makefile
 ```
 
 ## Makefile targets
 
 ```
-make setup          create .env and install all deps into .venv
+make setup          install Python deps into .venv via uv
 make download       pull model weights from HuggingFace
 make vllm           start vLLM server (foreground)
-make gateway        start API gateway (foreground)
-make gpu-exporter   start GPU Prometheus exporter
-make monitoring     start Prometheus + Grafana via docker-compose
+make gateway        build + start Rust gateway (foreground)
+make gpu-exporter   build + start Rust GPU Prometheus exporter
+make build-rust     compile both Rust crates (release, no run)
+make monitoring     start Prometheus + Grafana + Jaeger via docker-compose
 make loadtest       run load test against gateway
 make status         show GPU state and process health
-make stop           kill all background processes
+make stop           gracefully stop all background processes
+make logs           tail Loki + Promtail container logs
 ```
+
+## Rust gateway — design notes
+
+| Feature | Implementation |
+|---------|---------------|
+| Rate limiting | Per-IP GCRA via `governor`; lazy `DashMap<IpAddr, Arc<RateLimiter>>` |
+| Circuit breaker | Lockless `AtomicU8` state + `AtomicU64` failure counter; `compare_exchange` transitions |
+| Quota | `DashMap` in-memory cache (atomic fast path) flushed to SQLite every 10s; SHA-256 key hashing |
+| Streaming | `reqwest::bytes_stream()` → line buffer → `tokio::mpsc` → `Body::from_stream` |
+| TTFT | Measured on first non-empty `data: ` SSE line; recorded as Prometheus histogram |
+| Graceful shutdown | `SIGTERM`/`Ctrl-C` → `shutting_down` flag → 30s drain |
+| Observability | `tracing-subscriber` JSON + optional OpenTelemetry OTLP to Jaeger |
 
 ## Memory budget
 
@@ -239,7 +300,7 @@ The Grafana dashboard covers:
 - **Latency** — P50/P95/P99 end-to-end, TTFT percentiles
 - **GPU** — utilization, memory used/free, power draw, temperature, SM clock
 - **KV cache** — GPU utilization %, CPU swap, running/waiting/swapped sequences
-- **Errors** — 4xx/5xx by status code, auth failures, rate-limited requests
+- **Errors** — 4xx/5xx by status code, auth failures, rate-limited requests, quota exceeded
 
 Alert rules fire on:
 - KV cache > 85% / 95%
@@ -275,6 +336,18 @@ for chunk in stream:
 
 Authentication accepts both `Authorization: Bearer <key>` and `X-API-Key: <key>` headers.
 
+### Endpoints
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/health` | — | Liveness check |
+| GET | `/ready` | — | Readiness (polls vLLM `/health`) |
+| GET | `/metrics` | — | Prometheus text metrics |
+| GET | `/v1/models` | ✓ | List available models |
+| POST | `/v1/chat/completions` | ✓ | Chat completions (streaming or buffered) |
+| POST | `/v1/completions` | ✓ | Legacy completions |
+| GET | `/v1/usage` | ✓ | Per-key daily token usage |
+
 ## Production notes
 
 **Do not expose vLLM directly.** It has no auth and minimal error handling. Always route through the gateway.
@@ -286,3 +359,5 @@ Authentication accepts both `Authorization: Bearer <key>` and `X-API-Key: <key>`
 **Cold start:** First request after startup is slow — vLLM compiles Triton kernels on first run and caches them in `.triton_cache/`. Subsequent starts are faster. The gateway's `/ready` endpoint blocks until vLLM is healthy.
 
 **CPU swap:** `SWAP_SPACE_GB=8` in `.env` configures vLLM to spill KV blocks to RAM when GPU cache is full. Use as a safety valve only — PCIe bandwidth makes active swapping very slow.
+
+**First Rust build:** `make gateway` compiles from source on first run (~60s). Use `make build-rust` to pre-compile, or build the Docker image (`docker build -f docker/Dockerfile.gateway-rust .`) for a reproducible artifact.
