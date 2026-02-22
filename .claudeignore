@@ -1,0 +1,19 @@
+# Model weights — can be hundreds of GB
+models/
+
+# Rust build artifacts
+rust/target/
+
+# Python virtualenv
+.venv/
+
+# Triton kernel cache (compiled GPU kernels)
+.triton_cache/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Runtime logs
+*.log

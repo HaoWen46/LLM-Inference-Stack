@@ -16,15 +16,23 @@ fi
 # Activate venv
 source "$ROOT_DIR/.venv/bin/activate"
 
+# HF cache — HF_HOME is the current standard; TRANSFORMERS_CACHE is deprecated in v5
 export HF_HOME="${MODEL_CACHE_DIR:-$ROOT_DIR/models}"
-export TRANSFORMERS_CACHE="${MODEL_CACHE_DIR:-$ROOT_DIR/models}"
 
-# If CUDA_VISIBLE_DEVICES is empty string (common in some environments), set explicit devices
+# Redirect vLLM's torch_compile_cache and other caches away from home (limited quota)
+export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-/tmp2/b11902156/.cache/vllm}"
+mkdir -p "$VLLM_CACHE_ROOT"
+
+# Ensure consistent GPU indexing on mixed-GPU machines (4090 + 3090)
+export CUDA_DEVICE_ORDER="${CUDA_DEVICE_ORDER:-PCI_BUS_ID}"
+
+# If CUDA_VISIBLE_DEVICES is empty, fall back to first two GPUs
 if [[ -z "${CUDA_VISIBLE_DEVICES+x}" || -z "${CUDA_VISIBLE_DEVICES}" ]]; then
     export CUDA_VISIBLE_DEVICES="0,1"
 fi
 
-# NCCL tuning
+# NCCL tuning — IB disabled (no InfiniBand on consumer hardware),
+# P2P enabled, blocking waits so NCCL errors surface instead of hanging
 export NCCL_DEBUG=WARN
 export NCCL_IB_DISABLE=1
 export NCCL_P2P_DISABLE=0
@@ -45,6 +53,14 @@ if [[ "${QUANTIZATION:-none}" != "none" ]]; then
     fi
 fi
 
+# Consumer GPUs (RTX 4090 / 3090) don't support NVIDIA custom all-reduce
+# (requires NVLink / NVSwitch); disable it explicitly to suppress the warning.
+ALLREDUCE_ARG="--disable-custom-all-reduce"
+
+# Use vLLM's own generation defaults instead of the HuggingFace config,
+# so sampling params are not silently overridden by model-card suggestions.
+GEN_CONFIG_ARG="--generation-config vllm"
+
 PREFIX_CACHE_ARG="--enable-prefix-caching"
 CHUNKED_PREFILL_ARG="--enable-chunked-prefill"
 
@@ -53,6 +69,7 @@ echo "[vllm] TP size: ${TP_SIZE}"
 echo "[vllm] Quantization: ${QUANTIZATION:-none}"
 echo "[vllm] Max context: ${MAX_MODEL_LEN:-8192}"
 echo "[vllm] GPU memory util: ${GPU_MEMORY_UTILIZATION:-0.90}"
+echo "[vllm] GPUs: ${CUDA_VISIBLE_DEVICES}"
 
 exec python3 -m vllm.entrypoints.openai.api_server \
     --model "${MODEL_NAME}" \
@@ -69,6 +86,8 @@ exec python3 -m vllm.entrypoints.openai.api_server \
     --api-key "${VLLM_API_KEY}" \
     --uvicorn-log-level warning \
     --disable-log-requests \
+    ${ALLREDUCE_ARG} \
+    ${GEN_CONFIG_ARG} \
     ${QUANT_ARGS} \
     ${PREFIX_CACHE_ARG} \
     ${CHUNKED_PREFILL_ARG} \

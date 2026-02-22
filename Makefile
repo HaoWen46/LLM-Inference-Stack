@@ -75,7 +75,7 @@ monitoring-down:
 loadtest:
 	@source $(ENV_FILE) && \
 	  $(UV) run loadtest/runner.py \
-	    --url http://localhost:8080 \
+	    --url http://localhost:$${GATEWAY_PORT:-8080} \
 	    --key $$(echo $$GATEWAY_API_KEYS | cut -d, -f1) \
 	    --model $$SERVED_MODEL_NAME \
 	    --concurrency $${CONCURRENCY:-16} \
@@ -87,9 +87,13 @@ status:
 	@echo ""
 	@echo "=== Processes ===" && ps aux | grep -E 'vllm|gateway|gpu.exporter' | grep -v grep || true
 	@echo ""
-	@echo "=== vLLM health ===" && curl -sf http://localhost:8000/health && echo " OK" || echo " DOWN"
-	@echo "=== Gateway health ===" && curl -sf http://localhost:8080/health && echo " OK" || echo " DOWN"
-	@echo "=== GPU exporter ===" && curl -sf http://localhost:9101/health && echo " OK" || echo " DOWN"
+	@{ set -a; source $(ENV_FILE); set +a; \
+	   VLLM_PORT=$${VLLM_PORT:-8000}; \
+	   GATEWAY_PORT=$${GATEWAY_PORT:-8080}; \
+	   echo "=== vLLM health (port $$VLLM_PORT) ===" && curl -sf http://localhost:$$VLLM_PORT/health && echo " OK" || echo " DOWN"; \
+	   echo "=== Gateway health (port $$GATEWAY_PORT) ===" && curl -sf http://localhost:$$GATEWAY_PORT/health && echo " OK" || echo " DOWN"; \
+	   echo "=== GPU exporter ===" && curl -sf http://localhost:9101/health && echo " OK" || echo " DOWN"; \
+	}
 
 # ── Stop all (SIGTERM → 35s → SIGKILL) ────────────────────────────────────
 stop:

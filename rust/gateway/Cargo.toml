@@ -11,7 +11,7 @@ path = "src/main.rs"
 axum = { version = "0.7", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
 tower = "0.4"
-tower-http = { version = "0.5", features = ["trace", "cors", "request-id"] }
+tower-http = { version = "0.5", features = ["trace", "cors", "request-id", "util"] }
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
 prometheus-client = "0.22"
 governor = { version = "0.6", features = ["dashmap"] }

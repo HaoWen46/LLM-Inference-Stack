@@ -165,7 +165,7 @@ async fn collect_once(metrics: &GpuMetrics) {
         macro_rules! set {
             ($metric:expr, $idx:expr) => {
                 if let Ok(v) = safe_float(parts[$idx]) {
-                    $metric.get_or_create(&labels).set(v);
+                    $metric.get_or_create(&labels).set(v as i64);
                 }
             };
         }

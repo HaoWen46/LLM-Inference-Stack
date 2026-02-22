@@ -4,8 +4,10 @@ version = "0.2.0"
 description = "Production LLM inference stack (Rust gateway + Python load tester)"
 requires-python = ">=3.10"
 dependencies = [
-    # vLLM (kept as-is — requires GPU + CUDA)
-    "vllm==0.6.6",
+    # vLLM — >=0.8.5 required for Qwen3 MoE + FP8 pre-quantized checkpoints
+    "vllm>=0.8.5",
+    # transformers pinned <5 — transformers 5.x broke Qwen tokenizer API used by vLLM 0.10
+    "transformers>=4.53.2,<5.0",
     # Load tester
     "httpx[http2]==0.28.1",
     "rich==13.9.4",
@@ -24,12 +26,15 @@ dependencies = [
 # Run the load tester via: uv run loadtest
 loadtest = "loadtest.runner:main"
 
-[tool.uv]
-dev-dependencies = [
+[dependency-groups]
+dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
     "httpx>=0.28",
 ]
+
+[tool.hatch.build.targets.wheel]
+packages = ["loadtest"]
 
 [build-system]
 requires = ["hatchling"]
