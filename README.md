@@ -318,11 +318,16 @@ make logs           tail Loki + Promtail container logs
 
 | Feature | Implementation |
 |---------|---------------|
-| Rate limiting | Per-IP GCRA via `governor`; lazy `DashMap<IpAddr, Arc<RateLimiter>>` |
+| Authentication | `Authorization: Bearer` or `X-API-Key`; constant-time comparison via `subtle` crate (no timing side-channels) |
+| Rate limiting | Per-IP GCRA via `governor`; lazy `DashMap<IpAddr, Arc<RateLimiter>>`; background task evicts entries idle >1 hour |
 | Circuit breaker | Lockless `AtomicU8` state + `AtomicU64` failure counter; `compare_exchange` transitions |
 | Quota | `DashMap` in-memory cache (atomic fast path) flushed to SQLite every 10s; SHA-256 key hashing |
-| Streaming | `reqwest::bytes_stream()` → line buffer → `tokio::mpsc` → `Body::from_stream` |
+| Request size limit | `DefaultBodyLimit::max(4 MB)` — oversized bodies rejected with 413 before parsing or auth |
+| Streaming | `reqwest::bytes_stream()` → line buffer → `tokio::mpsc` → `Body::from_stream`; injects `stream_options: {include_usage: true}` for exact token counts |
 | TTFT | Measured on first non-empty `data: ` SSE line; recorded as Prometheus histogram |
+| Token counting | Streaming: exact `prompt_tokens`/`completion_tokens` from vLLM's final usage chunk; sync: from `usage` field in response JSON |
+| Security headers | `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `X-XSS-Protection` on every response via `SetResponseHeaderLayer` |
+| Error sanitization | `UpstreamError` messages (IPs, socket details) logged internally; clients receive only `"Upstream service unavailable"` |
 | Graceful shutdown | `SIGTERM`/`Ctrl-C` → `shutting_down` flag → 30s drain |
 | Observability | `tracing-subscriber` JSON + optional OpenTelemetry OTLP to Jaeger |
 
@@ -409,6 +414,8 @@ Authentication accepts both `Authorization: Bearer <key>` and `X-API-Key: <key>`
 ## Production notes
 
 **Do not expose vLLM directly.** It has no auth and minimal error handling. Always route through the gateway.
+
+**API key security:** generate keys with `openssl rand -hex 32` and set them in `GATEWAY_API_KEYS`. The gateway warns at startup if placeholder keys (`dev-key-1`, `dev-key-2`) are still configured. Keys are compared in constant time via the `subtle` crate and stored as SHA-256 hashes in SQLite.
 
 **NCCL hangs:** `TORCH_NCCL_BLOCKING_WAIT=1` is set in `scripts/launch_vllm.sh` so NCCL errors surface instead of hanging. `scripts/watchdog.py` can supervise and restart failed processes.
 

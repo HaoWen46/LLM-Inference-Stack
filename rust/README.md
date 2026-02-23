@@ -33,11 +33,14 @@ The gateway is an authentication + rate limiting + quota proxy in front of vLLM:
 
 | Layer | Responsibility |
 |-------|-----------------|
-| **Authentication** | Validates `Authorization: Bearer <key>` (SHA-256 hashed) |
-| **Rate Limiting** | Per-IP GCRA via `governor` crate; defaults to 1000 req/sec/IP |
-| **Quota** | Per-key daily token usage; DashMap fast path + SQLite persistence |
+| **Authentication** | `Authorization: Bearer` or `X-API-Key`; constant-time comparison (`subtle` crate); warns on placeholder keys at startup |
+| **Rate Limiting** | Per-IP GCRA via `governor`; background task evicts idle entries after 1 hour to bound memory |
+| **Body Limit** | `DefaultBodyLimit::max(4 MB)` — rejects oversized payloads with 413 before parsing or auth |
+| **Quota** | Per-key daily token usage; DashMap fast path + SQLite persistence; exact counts via `stream_options.include_usage` |
 | **Circuit Breaker** | Lockless atomic state machine; failfast if vLLM is down |
-| **Proxy** | HTTP/2 connection pool to vLLM; streams SSE responses efficiently |
+| **Proxy** | HTTP/2 connection pool to vLLM; SSE passthrough with line buffering; TTFT instrumentation |
+| **Security Headers** | `X-Content-Type-Options`, `X-Frame-Options`, `X-XSS-Protection` on every response |
+| **Error Sanitization** | Internal error details (upstream IPs, socket errors) logged only; clients receive generic messages |
 | **Metrics** | Prometheus histogram/counter/gauge metrics |
 | **Observability** | Structured JSON logging + OpenTelemetry OTLP to Jaeger |
 
@@ -121,9 +124,11 @@ OTLP_ENDPOINT=http://localhost:4317      # Jaeger OTLP receiver
 ### Performance Notes
 
 - **Latency**: Sub-millisecond request handling (proxy overhead < 1ms)
-- **Memory**: ~50MB resident (minimal allocations)
+- **Memory**: ~50MB resident; rate-limiter map bounded by 1-hour TTL eviction
 - **Concurrency**: All async; handles thousands of concurrent connections
 - **Connections**: HTTP/2 keep-alive pool to vLLM; reuses connections
+- **Token counting**: Streaming responses inject `stream_options: {include_usage: true}`; vLLM returns exact counts in the final SSE chunk instead of relying on whitespace approximation
+- **Hex encoding**: Pre-allocated `String::with_capacity(64)` + `write!` in quota SHA-256 path (32× fewer allocations vs the old `map(format!)` approach)
 - **Graceful Shutdown**: 30-second drain period on SIGTERM; waits for in-flight requests
 
 ## GPU Exporter (`gpu-exporter/`)

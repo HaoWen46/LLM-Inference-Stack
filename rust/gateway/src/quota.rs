@@ -265,7 +265,13 @@ fn hash_hex(api_key: &str) -> String {
 }
 
 fn hex_encode(bytes: &[u8; 32]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    use std::fmt::Write as _;
+    // Pre-allocate exact capacity (32 bytes → 64 hex chars) and write in one pass.
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        write!(s, "{:02x}", b).unwrap();
+    }
+    s
 }
 
 fn hex_to_hash(s: &str) -> Option<KeyHash> {

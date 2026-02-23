@@ -316,6 +316,9 @@ async fn stream_proxy(
 ) -> Result<Response, GatewayError> {
     let start = Instant::now();
     body["stream"] = Value::Bool(true);
+    // Ask vLLM to append a final usage chunk so we get exact token counts
+    // instead of relying on whitespace approximation.
+    body["stream_options"] = serde_json::json!({"include_usage": true});
 
     // Check circuit breaker before spawning the background task.
     state.circuit_breaker.before_call()?;
@@ -382,8 +385,10 @@ async fn stream_proxy(
             let mut byte_stream = resp.bytes_stream();
             let mut line_buf: Vec<u8> = Vec::new();
             let mut first_token = true;
-            let mut approx_tokens: u64 = 0;
             let mut ttft = 0f64;
+            // Exact counts from vLLM's usage chunk (stream_options.include_usage).
+            let mut exact_prompt_tokens: u64 = 0;
+            let mut exact_completion_tokens: u64 = 0;
 
             while let Some(chunk_result) = byte_stream.next().await {
                 let chunk = match chunk_result {
@@ -410,34 +415,43 @@ async fn stream_proxy(
                                 continue;
                             }
 
-                            // Measure TTFT on first content data line
-                            if first_token
-                                && line.starts_with("data: ")
-                                && line != "data: [DONE]"
-                            {
-                                ttft = start.elapsed().as_secs_f64();
-                                state
-                                    .metrics
-                                    .ttft
-                                    .get_or_create(&ModelLabel {
-                                        model: model.clone(),
-                                    })
-                                    .observe(ttft);
-                                info!(ttft_ms = (ttft * 1000.0) as u64, "first token");
-                                first_token = false;
-                            }
-
-                            // Approximate token count from delta content (word split)
                             if line.starts_with("data: ") && line != "data: [DONE]" {
                                 if let Ok(chunk_json) =
                                     serde_json::from_str::<Value>(&line[6..])
                                 {
-                                    if let Some(delta) = chunk_json
-                                        .pointer("/choices/0/delta/content")
-                                        .and_then(|v| v.as_str())
+                                    // Measure TTFT on first chunk that carries delta content.
+                                    if first_token
+                                        && chunk_json
+                                            .pointer("/choices/0/delta/content")
+                                            .is_some()
                                     {
-                                        approx_tokens +=
-                                            delta.split_whitespace().count() as u64;
+                                        ttft = start.elapsed().as_secs_f64();
+                                        state
+                                            .metrics
+                                            .ttft
+                                            .get_or_create(&ModelLabel {
+                                                model: model.clone(),
+                                            })
+                                            .observe(ttft);
+                                        info!(ttft_ms = (ttft * 1000.0) as u64, "first token");
+                                        first_token = false;
+                                    }
+
+                                    // Capture exact token counts from the usage chunk
+                                    // vLLM sends when stream_options.include_usage = true.
+                                    if let Some(usage) = chunk_json.get("usage") {
+                                        if let Some(p) = usage
+                                            .get("prompt_tokens")
+                                            .and_then(|v| v.as_u64())
+                                        {
+                                            exact_prompt_tokens = p;
+                                        }
+                                        if let Some(c) = usage
+                                            .get("completion_tokens")
+                                            .and_then(|v| v.as_u64())
+                                        {
+                                            exact_completion_tokens = c;
+                                        }
                                     }
                                 }
                             }
@@ -453,15 +467,25 @@ async fn stream_proxy(
             }
 
             let duration = start.elapsed().as_secs_f64();
+            let total_tokens = exact_prompt_tokens + exact_completion_tokens;
 
-            if approx_tokens > 0 {
+            if exact_completion_tokens > 0 {
                 state
                     .metrics
                     .tokens_generated
                     .get_or_create(&ModelLabel {
                         model: model.clone(),
                     })
-                    .inc_by(approx_tokens);
+                    .inc_by(exact_completion_tokens);
+            }
+            if exact_prompt_tokens > 0 {
+                state
+                    .metrics
+                    .tokens_prompted
+                    .get_or_create(&ModelLabel {
+                        model: model.clone(),
+                    })
+                    .inc_by(exact_prompt_tokens);
             }
 
             state
@@ -486,9 +510,10 @@ async fn stream_proxy(
 
             info!(
                 duration_ms = (duration * 1000.0) as u64,
-                approx_tokens,
+                prompt_tokens = exact_prompt_tokens,
+                completion_tokens = exact_completion_tokens,
                 tok_per_sec = if duration > 0.0 {
-                    (approx_tokens as f64 / duration) as u64
+                    (total_tokens as f64 / duration) as u64
                 } else {
                     0
                 },
@@ -496,8 +521,10 @@ async fn stream_proxy(
                 "stream complete"
             );
 
-            if approx_tokens > 0 {
-                state.quota.add_tokens(&api_key, 0, approx_tokens);
+            if total_tokens > 0 {
+                state
+                    .quota
+                    .add_tokens(&api_key, exact_prompt_tokens, exact_completion_tokens);
             }
         }
     });

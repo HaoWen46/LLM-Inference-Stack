@@ -11,12 +11,13 @@ path = "src/main.rs"
 axum = { version = "0.7", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
 tower = "0.4"
-tower-http = { version = "0.5", features = ["trace", "cors", "request-id", "util"] }
+tower-http = { version = "0.5", features = ["trace", "cors", "request-id", "util", "set-header"] }
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
 prometheus-client = "0.22"
 governor = { version = "0.6", features = ["dashmap"] }
 sqlx = { version = "0.7", features = ["sqlite", "runtime-tokio-rustls", "macros"] }
 sha2 = "0.10"
+subtle = "2"
 dashmap = "5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -19,12 +19,13 @@ use std::{
 };
 
 use axum::{
-    extract::{ConnectInfo, State},
-    http::StatusCode,
+    extract::State,
+    http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Json},
     routing::{get, post},
     Router,
 };
+
 use tokio::signal;
 use tower_http::{request_id::MakeRequestUuid, trace::TraceLayer, ServiceBuilderExt};
 use tracing::info;
@@ -63,6 +64,18 @@ async fn main() -> anyhow::Result<()> {
 
     info!(version = env!("CARGO_PKG_VERSION"), "gateway starting");
 
+    // Warn if operator forgot to replace the example placeholder keys.
+    const DEFAULT_KEYS: &[&str] = &["dev-key-1", "dev-key-2"];
+    for k in DEFAULT_KEYS {
+        if config.gateway_api_keys.contains(*k) {
+            tracing::warn!(
+                key = k,
+                "SECURITY: GATEWAY_API_KEYS contains a default placeholder — \
+                 replace with a strong random secret before exposing to the internet"
+            );
+        }
+    }
+
     // ── Metrics ──────────────────────────────────────────────────────────────
     let app_metrics = AppMetrics::new();
 
@@ -75,6 +88,7 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Rate limiter ──────────────────────────────────────────────────────────
     let rate_limiters = Arc::new(RateLimiterMap::new(config.rate_limit_per_minute));
+    rate_limiters.start_cleanup_task();
 
     // ── Quota store (SQLite) ──────────────────────────────────────────────────
     let quota = QuotaStore::new(config.daily_token_quota, "data/usage.db").await?;
@@ -134,12 +148,29 @@ async fn main() -> anyhow::Result<()> {
 // ── Router construction ───────────────────────────────────────────────────────
 
 fn build_router(state: Arc<AppState>) -> Router {
+    use axum::extract::DefaultBodyLimit;
     use tower::ServiceBuilder;
+    use tower_http::set_header::SetResponseHeaderLayer;
 
+    // All global middleware in one ServiceBuilder so the response-header layers
+    // run in the same proven chain as TraceLayer/RequestId (which already work).
     let middleware = ServiceBuilder::new()
         .set_x_request_id(MakeRequestUuid)
         .propagate_x_request_id()
-        .layer(TraceLayer::new_for_http());
+        .layer(TraceLayer::new_for_http())
+        // Security headers — added to every response after tracing is recorded.
+        .layer(SetResponseHeaderLayer::overriding(
+            header::HeaderName::from_static("x-content-type-options"),
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::HeaderName::from_static("x-frame-options"),
+            HeaderValue::from_static("DENY"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::HeaderName::from_static("x-xss-protection"),
+            HeaderValue::from_static("1; mode=block"),
+        ));
 
     Router::new()
         // ── Public (no auth) ─────────────────────────────────────────────────
@@ -151,6 +182,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/models", get(proxy::models_handler))
         .route("/v1/chat/completions", post(proxy::chat_completions_handler))
         .route("/v1/completions", post(proxy::completions_handler))
+        // ── Global middleware ─────────────────────────────────────────────────
+        .layer(DefaultBodyLimit::max(4 * 1024 * 1024)) // 4 MB — rejects oversized bodies
         .layer(middleware)
         .with_state(state)
 }

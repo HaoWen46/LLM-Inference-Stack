@@ -5,6 +5,7 @@ use axum::{
 };
 use serde_json::json;
 use thiserror::Error;
+use tracing::error;
 
 #[derive(Error, Debug)]
 pub enum GatewayError {
@@ -23,7 +24,8 @@ pub enum GatewayError {
     #[error("Upstream request timed out")]
     UpstreamTimeout,
 
-    #[error("Cannot reach upstream: {0}")]
+    // Internal detail kept in the variant but never sent to the client.
+    #[error("upstream error: {0}")]
     UpstreamError(String),
 
     #[error("Invalid request: {0}")]
@@ -38,6 +40,17 @@ pub enum GatewayError {
 
 impl IntoResponse for GatewayError {
     fn into_response(self) -> Response {
+        // Log full detail internally before sanitizing the client-facing message.
+        match &self {
+            GatewayError::UpstreamError(detail) => {
+                error!(detail, "upstream error");
+            }
+            GatewayError::Internal(e) => {
+                error!(detail = %e, "internal error");
+            }
+            _ => {}
+        }
+
         let status = match &self {
             GatewayError::Unauthorized => StatusCode::UNAUTHORIZED,
             GatewayError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
@@ -50,7 +63,9 @@ impl IntoResponse for GatewayError {
             GatewayError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
+        // Sanitized messages — no internal details (IPs, socket errors, etc.) leak.
         let message = match &self {
+            GatewayError::UpstreamError(_) => "Upstream service unavailable".to_string(),
             GatewayError::Internal(_) => "Internal server error".to_string(),
             other => other.to_string(),
         };
