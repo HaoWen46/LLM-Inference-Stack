@@ -9,7 +9,7 @@ use axum::{
 use bytes::Bytes;
 use futures::StreamExt;
 use serde_json::Value;
-use std::{net::SocketAddr, sync::Arc, time::Instant};
+use std::{net::SocketAddr, path::Path, sync::Arc, time::Instant};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, warn};
 
@@ -21,6 +21,78 @@ use crate::{
 };
 
 // ── Public route handlers ────────────────────────────────────────────────────
+
+/// GET /v1/models/local — list model weights available on disk (no vLLM call)
+pub async fn local_models_handler(
+    State(state): State<Arc<AppState>>,
+    ApiKey(_api_key): ApiKey,
+) -> Result<impl IntoResponse, GatewayError> {
+    let root = Path::new(&state.config.model_cache_dir);
+    let mut data: Vec<Value> = Vec::new();
+
+    if root.exists() {
+        // GGUF files — walk recursively, return path relative to cache_dir
+        if let Ok(entries) = walkdir_gguf(root) {
+            for rel_path in entries {
+                data.push(serde_json::json!({
+                    "id": rel_path,
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "local",
+                    "format": "gguf"
+                }));
+            }
+        }
+
+        // HuggingFace Hub cache dirs: "models--org--repo" → "org/repo"
+        if let Ok(dir_iter) = std::fs::read_dir(root) {
+            let mut hf_entries: Vec<String> = dir_iter
+                .flatten()
+                .filter(|e| e.path().is_dir())
+                .filter_map(|e| {
+                    let name = e.file_name().into_string().ok()?;
+                    let tail = name.strip_prefix("models--")?;
+                    let (org, repo) = tail.split_once("--")?;
+                    Some(format!("{}/{}", org, repo))
+                })
+                .collect();
+            hf_entries.sort();
+            for hf_id in hf_entries {
+                data.push(serde_json::json!({
+                    "id": hf_id,
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "local",
+                    "format": "hf"
+                }));
+            }
+        }
+    }
+
+    Ok(Json(serde_json::json!({"object": "list", "data": data})))
+}
+
+/// Recursively collect `.gguf` paths relative to `root`, sorted.
+fn walkdir_gguf(root: &Path) -> std::io::Result<Vec<String>> {
+    let mut results = Vec::new();
+    collect_gguf(root, root, &mut results)?;
+    results.sort();
+    Ok(results)
+}
+
+fn collect_gguf(root: &Path, dir: &Path, out: &mut Vec<String>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)?.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_gguf(root, &path, out)?;
+        } else if path.extension().and_then(|e| e.to_str()) == Some("gguf") {
+            if let Ok(rel) = path.strip_prefix(root) {
+                out.push(rel.to_string_lossy().into_owned());
+            }
+        }
+    }
+    Ok(())
+}
 
 /// GET /v1/usage — per-key daily token usage
 pub async fn usage_handler(

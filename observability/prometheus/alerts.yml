@@ -104,3 +104,12 @@ groups:
           severity: critical
         annotations:
           summary: "Gateway error rate > 5%"
+
+      - alert: CircuitBreakerOpen
+        expr: gateway_circuit_breaker_state == 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Gateway circuit breaker has been OPEN for >2 minutes"
+          description: "vLLM upstream is considered unhealthy. Circuit will probe after CB_RECOVERY_TIMEOUT seconds."

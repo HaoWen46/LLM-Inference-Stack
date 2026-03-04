@@ -104,6 +104,7 @@ VLLM_API_KEY=change-me           # internal secret between gateway and vLLM
 
 GATEWAY_PORT=8020
 GATEWAY_API_KEYS=key1,key2       # bearer tokens your clients will use
+MODEL_CACHE_DIR=./models         # scanned by GET /v1/models/local
 
 TP_SIZE=2                        # one shard per GPU
 DTYPE=auto                       # auto-detects FP8 from model config.json
@@ -294,6 +295,10 @@ Outputs live stats (req/s, P50/P95/P99 latency, TTFT) and a final report.
 │   ├── Dockerfile.vllm
 │   └── docker-compose.yml
 │
+├── tests/
+│   ├── conftest.py           ← fixtures: mock vLLM (respx), ASGI transport, DB stubs
+│   └── test_openai_compat.py ← 17 OpenAI SDK compatibility tests
+│
 ├── pyproject.toml
 └── Makefile
 ```
@@ -406,10 +411,82 @@ Authentication accepts both `Authorization: Bearer <key>` and `X-API-Key: <key>`
 | GET | `/health` | — | Liveness check |
 | GET | `/ready` | — | Readiness (polls vLLM `/health`) |
 | GET | `/metrics` | — | Prometheus text metrics |
-| GET | `/v1/models` | ✓ | List available models |
+| GET | `/v1/models` | ✓ | List models currently loaded in vLLM |
+| GET | `/v1/models/local` | ✓ | List model weight files on disk (see below) |
 | POST | `/v1/chat/completions` | ✓ | Chat completions (streaming or buffered) |
 | POST | `/v1/completions` | ✓ | Legacy completions |
 | GET | `/v1/usage` | ✓ | Per-key daily token usage |
+
+### `/v1/models/local` — discover models on disk
+
+Returns every GGUF file and HuggingFace model directory found under `MODEL_CACHE_DIR`, formatted so you can copy-paste the `id` straight into your request body.
+
+```bash
+curl http://localhost:8020/v1/models/local \
+  -H "Authorization: Bearer dev-key-1"
+```
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "TeichAI/GLM-4.7-Flash-Claude-Opus-4.5-High-Reasoning-Distill-GGUF:Q8_0.gguf",
+      "object": "model",
+      "owned_by": "local",
+      "format": "gguf"
+    },
+    {
+      "id": "meta-llama/Llama-3.2-7B-Instruct",
+      "object": "model",
+      "owned_by": "local",
+      "format": "hf"
+    }
+  ]
+}
+```
+
+Scans two layouts:
+- **GGUF files** — any `*.gguf` found recursively; `id` is the path relative to `MODEL_CACHE_DIR`
+- **HuggingFace Hub cache dirs** — directories named `models--<org>--<repo>` (standard `huggingface_hub` cache layout) are converted to `org/repo` format
+
+### Error format
+
+All errors use the OpenAI error schema so standard SDK exception handling works without modification:
+
+```json
+{
+  "error": {
+    "message": "Invalid or missing API key",
+    "type": "authentication_error",
+    "param": null,
+    "code": null
+  }
+}
+```
+
+| HTTP status | `type` |
+|-------------|--------|
+| 401 | `authentication_error` |
+| 400 / 422 | `invalid_request_error` |
+| 429 | `rate_limit_error` |
+| 5xx | `api_error` |
+
+## Testing
+
+The test suite validates OpenAI SDK compatibility against the Python gateway running in-process — no GPU or vLLM process required.
+
+```bash
+# Install dev deps only (skips vllm/torch)
+uv sync --only-group dev --no-install-project
+
+# Run all 17 tests
+.venv/bin/pytest tests/ -v
+```
+
+Tests cover: `/health`, `/v1/models`, `/v1/models/local`, chat completions (sync + streaming), authentication errors, invalid JSON, upstream 5xx passthrough, OpenAI error schema validation, and per-key usage endpoint.
+
+vLLM is mocked with `respx`; the gateway's SQLite usage-DB is patched with `AsyncMock` stubs so tests are fully self-contained.
 
 ## Production notes
 

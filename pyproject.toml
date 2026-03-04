@@ -31,10 +31,26 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
     "httpx>=0.28",
+    "openai>=1.0",
+    "respx>=0.21",
+    "asgi-lifespan>=2.0",
+    # Gateway runtime deps (subset without vllm/torch)
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "aiosqlite>=0.20",
+    "slowapi>=0.1.9",
+    "structlog>=24.0",
+    "prometheus-client>=0.20",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["loadtest"]
+packages = ["llm_inference_stack"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
 
 [build-system]
 requires = ["hatchling"]

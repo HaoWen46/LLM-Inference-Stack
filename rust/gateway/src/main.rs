@@ -179,6 +179,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/metrics", get(metrics_handler))
         // ── Authenticated ─────────────────────────────────────────────────────
         .route("/v1/usage", get(proxy::usage_handler))
+        .route("/v1/models/local", get(proxy::local_models_handler))
         .route("/v1/models", get(proxy::models_handler))
         .route("/v1/chat/completions", post(proxy::chat_completions_handler))
         .route("/v1/completions", post(proxy::completions_handler))

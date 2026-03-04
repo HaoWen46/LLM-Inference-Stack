@@ -64,10 +64,32 @@ impl IntoResponse for GatewayError {
         };
 
         // Sanitized messages — no internal details (IPs, socket errors, etc.) leak.
-        let message = match &self {
-            GatewayError::UpstreamError(_) => "Upstream service unavailable".to_string(),
-            GatewayError::Internal(_) => "Internal server error".to_string(),
-            other => other.to_string(),
+        let (message, error_type) = match &self {
+            GatewayError::Unauthorized => (
+                "Invalid or missing API key".to_string(),
+                "authentication_error",
+            ),
+            GatewayError::RateLimited => (
+                "Rate limit exceeded".to_string(),
+                "rate_limit_error",
+            ),
+            GatewayError::QuotaExceeded => (
+                "Daily token quota exceeded".to_string(),
+                "rate_limit_error",
+            ),
+            GatewayError::BadRequest(msg) => (
+                format!("Invalid request: {}", msg),
+                "invalid_request_error",
+            ),
+            GatewayError::UpstreamError(_) => (
+                "Upstream service unavailable".to_string(),
+                "api_error",
+            ),
+            GatewayError::Internal(_) => (
+                "Internal server error".to_string(),
+                "api_error",
+            ),
+            other => (other.to_string(), "api_error"),
         };
 
         let mut headers = axum::http::HeaderMap::new();
@@ -78,6 +100,18 @@ impl IntoResponse for GatewayError {
             );
         }
 
-        (status, headers, Json(json!({"detail": message}))).into_response()
+        (
+            status,
+            headers,
+            Json(json!({
+                "error": {
+                    "message": message,
+                    "type": error_type,
+                    "param": null,
+                    "code": null
+                }
+            })),
+        )
+            .into_response()
     }
 }

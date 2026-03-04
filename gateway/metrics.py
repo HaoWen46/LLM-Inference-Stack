@@ -52,3 +52,19 @@ RATE_LIMITED = Counter(
     "gateway_rate_limited_total",
     "Requests rejected by rate limiter",
 )
+
+# Circuit breaker state: 0=CLOSED, 1=OPEN, 2=HALF_OPEN
+CIRCUIT_BREAKER_STATE = Gauge(
+    "gateway_circuit_breaker_state",
+    "Circuit breaker state (0=closed, 1=open, 2=half_open)",
+)
+
+QUOTA_EXCEEDED = Counter(
+    "gateway_quota_exceeded_total",
+    "Requests rejected due to daily token quota exhausted",
+)
+
+INFLIGHT_TASKS = Gauge(
+    "gateway_inflight_requests",
+    "Number of asyncio tasks currently processing requests (for graceful drain tracking)",
+)

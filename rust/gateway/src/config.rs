@@ -38,6 +38,9 @@ pub struct Config {
 
     // ── Token quota (0 = unlimited) ──────────────────────────────────────────
     pub daily_token_quota: u64,
+
+    // ── Local model cache ─────────────────────────────────────────────────────
+    pub model_cache_dir: String,
 }
 
 impl Config {
@@ -74,6 +77,7 @@ impl Config {
             cb_recovery_timeout_secs: env_u64("CB_RECOVERY_TIMEOUT", 30),
             cb_half_open_max_calls: env_u64("CB_HALF_OPEN_MAX_CALLS", 1),
             daily_token_quota: env_u64("DAILY_TOKEN_QUOTA", 0),
+            model_cache_dir: env_or("MODEL_CACHE_DIR", "models"),
         })
     }
 }

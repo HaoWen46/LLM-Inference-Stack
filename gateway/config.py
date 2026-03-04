@@ -31,6 +31,21 @@ class Settings(BaseSettings):
     # Logging
     log_level: str = Field("INFO", env="LOG_LEVEL")
 
+    # OpenTelemetry
+    otel_exporter_otlp_endpoint: str = Field("http://localhost:4317", env="OTEL_EXPORTER_OTLP_ENDPOINT")
+    otel_enabled: bool = Field(True, env="OTEL_ENABLED")
+
+    # Circuit breaker
+    cb_failure_threshold: int = Field(5, env="CB_FAILURE_THRESHOLD")
+    cb_recovery_timeout: float = Field(30.0, env="CB_RECOVERY_TIMEOUT")
+    cb_half_open_max_calls: int = Field(1, env="CB_HALF_OPEN_MAX_CALLS")
+
+    # Token quota (0 = unlimited)
+    daily_token_quota: int = Field(0, env="DAILY_TOKEN_QUOTA")
+
+    # Directory that holds downloaded model weights / GGUF files
+    model_cache_dir: str = Field("models", env="MODEL_CACHE_DIR")
+
     @property
     def valid_api_keys(self) -> set[str]:
         return {k.strip() for k in self.gateway_api_keys.split(",") if k.strip()}
