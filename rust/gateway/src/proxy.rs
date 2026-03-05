@@ -44,19 +44,38 @@ pub async fn local_models_handler(
             }
         }
 
-        // HuggingFace Hub cache dirs: "models--org--repo" → "org/repo"
+        // HuggingFace model directories — two layouts:
+        //   1. HF Hub cache:  "models--org--repo"  → "org/repo"
+        //   2. Flat snapshot: "org/repo"           → "org/repo"
         if let Ok(dir_iter) = std::fs::read_dir(root) {
-            let mut hf_entries: Vec<String> = dir_iter
-                .flatten()
-                .filter(|e| e.path().is_dir())
-                .filter_map(|e| {
-                    let name = e.file_name().into_string().ok()?;
-                    let tail = name.strip_prefix("models--")?;
-                    let (org, repo) = tail.split_once("--")?;
-                    Some(format!("{}/{}", org, repo))
-                })
-                .collect();
+            let mut hf_entries: Vec<String> = Vec::new();
+            for entry in dir_iter.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let name = entry.file_name().into_string().unwrap_or_default();
+                // Layout 1: models--org--repo
+                if let Some(tail) = name.strip_prefix("models--") {
+                    if let Some((org, repo)) = tail.split_once("--") {
+                        hf_entries.push(format!("{}/{}", org, repo));
+                        continue;
+                    }
+                }
+                // Layout 2: org/repo — org dir containing subdirs with config.json
+                if !name.starts_with('.') {
+                    if let Ok(subdirs) = std::fs::read_dir(&path) {
+                        for sub in subdirs.flatten() {
+                            if sub.path().join("config.json").exists() {
+                                let repo = sub.file_name().into_string().unwrap_or_default();
+                                hf_entries.push(format!("{}/{}", name, repo));
+                            }
+                        }
+                    }
+                }
+            }
             hf_entries.sort();
+            hf_entries.dedup();
             for hf_id in hf_entries {
                 data.push(serde_json::json!({
                     "id": hf_id,
