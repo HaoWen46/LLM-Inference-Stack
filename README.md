@@ -162,6 +162,12 @@ Open two terminal panes (or use tmux):
 
 ```bash
 # PostgreSQL (required for gateway key store and quota)
+# Requires the Docker daemon to be running. On cluster nodes without root:
+#   conda install -y -p ~/.local/share/pgenv -c conda-forge postgresql
+#   initdb -D ~/.local/share/pgdata -U gateway --no-locale --encoding=UTF8
+#   pg_ctl -D ~/.local/share/pgdata -o "-p 5432" start
+#   createdb -h localhost -p 5432 -U gateway gateway
+#   # then set: DATABASE_URL=postgresql://gateway@localhost:5432/gateway
 make db
 
 # Pane 1 — inference engine
@@ -231,9 +237,10 @@ curl http://localhost:8080/v1/usage \
 ### 7. Load test
 
 ```bash
-make loadtest
+# API_KEY must be a valid key — either pass it explicitly or set GATEWAY_API_KEYS in .env
+API_KEY=gw_... make loadtest
 # tune concurrency and duration:
-CONCURRENCY=32 DURATION=120 make loadtest
+API_KEY=gw_... CONCURRENCY=32 DURATION=120 make loadtest
 ```
 
 Outputs live stats (req/s, P50/P95/P99 latency, TTFT) and a final report.

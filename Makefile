@@ -82,20 +82,37 @@ monitoring-down:
 	@docker compose -f docker/docker-compose.yml down
 
 # ── Load test ──────────────────────────────────────────────────────────────
+# API key resolution (in order of priority):
+#   1. API_KEY=<key> make loadtest   (explicit, recommended with DB-backed keys)
+#   2. First entry in GATEWAY_API_KEYS from config/.env  (legacy seed key)
+#   3. Abort with a clear error if neither is set
 loadtest:
-	@source $(ENV_FILE) && \
+	@{ \
+	  set -a; source $(ENV_FILE); set +a; \
+	  KEY="$${API_KEY:-$$(echo "$${GATEWAY_API_KEYS:-}" | cut -d, -f1)}"; \
+	  if [ -z "$$KEY" ]; then \
+	      echo "[loadtest] ERROR: no API key."; \
+	      echo "  Pass API_KEY=<key> make loadtest, or set GATEWAY_API_KEYS in config/.env"; \
+	      exit 1; \
+	  fi; \
+	  PORT="$${GATEWAY_PORT:-8080}"; \
+	  if ! curl -sf "http://localhost:$$PORT/health" >/dev/null 2>&1; then \
+	      echo "[loadtest] ERROR: gateway not responding on :$$PORT — is it running?"; \
+	      exit 1; \
+	  fi; \
 	  $(UV) run loadtest/runner.py \
-	    --url http://localhost:$${GATEWAY_PORT:-8080} \
-	    --key $$(echo $$GATEWAY_API_KEYS | cut -d, -f1) \
-	    --model $$SERVED_MODEL_NAME \
-	    --concurrency $${CONCURRENCY:-16} \
-	    --duration $${DURATION:-60}
+	      --url "http://localhost:$$PORT" \
+	      --key "$$KEY" \
+	      --model "$${SERVED_MODEL_NAME:-$$MODEL_NAME}" \
+	      --concurrency "$${CONCURRENCY:-16}" \
+	      --duration "$${DURATION:-60}"; \
+	}
 
 # ── Status ─────────────────────────────────────────────────────────────────
 status:
 	@echo "=== GPU ===" && nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.free,temperature.gpu,power.draw --format=csv,noheader 2>/dev/null || echo "  (no GPU)"
 	@echo ""
-	@echo "=== Processes ===" && ps aux | grep -E 'vllm|gateway|gpu.exporter' | grep -v grep || true
+	@echo "=== Processes ===" && ps aux | grep -E 'vllm|gateway|gpu-exporter' | grep -v grep || true
 	@echo ""
 	@{ set -a; source $(ENV_FILE); set +a; \
 	   VLLM_PORT=$${VLLM_PORT:-8000}; \
@@ -105,18 +122,37 @@ status:
 	   echo "=== GPU exporter ===" && curl -sf http://localhost:9101/health && echo " OK" || echo " DOWN"; \
 	}
 
-# ── Stop all (SIGTERM → 35s → SIGKILL) ────────────────────────────────────
+# ── Stop all (SIGTERM → wait up to 35s → SIGKILL) ─────────────────────────
+# Safety: never use `pkill -f <pattern>` — the pattern literal lives in the
+# shell's argv and causes self-termination.  Instead:
+#   • Rust binaries: pgrep -x <name>  (match by comm, not full cmdline)
+#   • vLLM main:     pgrep -f with [.] trick so literal string ≠ regex match
+#   • vLLM workers:  pgrep <VLLM>     (match comm prefix, no -f)
 stop:
-	@echo "Sending SIGTERM to gateway..."
-	@pkill -SIGTERM -f 'target/release/gateway' || true
-	@echo "Sending SIGTERM to vLLM..."
-	@pkill -SIGTERM -f 'vllm.entrypoints' || true
-	@pkill -SIGTERM -f 'target/release/gpu-exporter' || true
-	@echo "Waiting up to 35s for graceful shutdown..."
-	@sleep 35
-	@pkill -9 -f 'vllm.entrypoints'         2>/dev/null || true
-	@pkill -9 -f 'target/release/gateway'   2>/dev/null || true
-	@pkill -9 -f 'target/release/gpu-exporter' 2>/dev/null || true
+	@echo "Stopping services..."
+	@{ \
+	  _kill() { sig=$$1; shift; pids="$$*"; [ -n "$$pids" ] && kill -$$sig $$pids 2>/dev/null || true; }; \
+	  _kill TERM $$(pgrep -x gateway 2>/dev/null); \
+	  _kill TERM $$(pgrep -x gpu-exporter 2>/dev/null); \
+	  _kill TERM $$(pgrep -f 'vllm[.]entrypoints' 2>/dev/null); \
+	  _kill TERM $$(pgrep 'VLLM' 2>/dev/null); \
+	  _kill TERM $$(pgrep -f 'llama_cpp[.]server' 2>/dev/null); \
+	  printf 'Waiting for graceful shutdown'; \
+	  end=$$((SECONDS + 35)); \
+	  while \
+	      pgrep -x gateway >/dev/null 2>&1 || \
+	      pgrep -f 'vllm[.]entrypoints' >/dev/null 2>&1 || \
+	      pgrep 'VLLM' >/dev/null 2>&1 || \
+	      pgrep -f 'llama_cpp[.]server' >/dev/null 2>&1; do \
+	      [ $$SECONDS -ge $$end ] && break; \
+	      printf '.'; sleep 1; \
+	  done; echo; \
+	  _kill KILL $$(pgrep -x gateway 2>/dev/null); \
+	  _kill KILL $$(pgrep -x gpu-exporter 2>/dev/null); \
+	  _kill KILL $$(pgrep -f 'vllm[.]entrypoints' 2>/dev/null); \
+	  _kill KILL $$(pgrep 'VLLM' 2>/dev/null); \
+	  _kill KILL $$(pgrep -f 'llama_cpp[.]server' 2>/dev/null); \
+	}
 	@echo "Stopped."
 
 # ── Log tailing ────────────────────────────────────────────────────────────

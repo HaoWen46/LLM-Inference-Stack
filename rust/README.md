@@ -295,7 +295,16 @@ RUST_LOG=debug make gateway
 **Gateway won't start — "DATABASE_URL is required"**
 ```bash
 export DATABASE_URL=postgresql://gateway:changeme@localhost:5432/gateway
-make db   # start postgres if not running
+make db   # start postgres via Docker (requires Docker daemon)
+```
+
+`make db` requires the Docker daemon. On cluster nodes without root access, run a user-space PostgreSQL via conda instead:
+```bash
+conda install -y -p ~/.local/share/pgenv -c conda-forge postgresql --no-default-packages
+~/.local/share/pgenv/bin/initdb -D ~/.local/share/pgdata -U gateway --no-locale --encoding=UTF8
+~/.local/share/pgenv/bin/pg_ctl -D ~/.local/share/pgdata -o "-p 5432" start
+~/.local/share/pgenv/bin/createdb -h localhost -p 5432 -U gateway gateway
+export DATABASE_URL=postgresql://gateway@localhost:5432/gateway
 ```
 
 **Gateway won't start — "VLLM_API_KEY is required"**
@@ -321,6 +330,9 @@ vLLM will enter HALF_OPEN after `CB_RECOVERY_TIMEOUT` (default 30s) and probe wi
 
 **Streaming requests hang**
 KV cache pressure — reduce `MAX_NUM_SEQS` or `MAX_MODEL_LEN` in vLLM config, or increase `REQUEST_TIMEOUT_SECONDS`.
+
+**`make stop` terminates itself instead of the services**
+`pkill -f <pattern>` searches the full command line of every process including its own parent shell, which contains the pattern literal in its argv. `make stop` avoids this by using `pgrep -x` (match by process comm name) for Rust binaries and `pgrep 'VLLM'` for vLLM workers, plus `pgrep -f 'vllm[.]entrypoints'` (the `[.]` character class matches a dot but the literal string `vllm[.]entrypoints` does not). If you write custom stop scripts, use the same techniques to avoid self-termination.
 
 ## See Also
 

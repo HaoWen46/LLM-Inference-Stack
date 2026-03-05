@@ -42,7 +42,7 @@ pub struct KeyStore {
 impl KeyStore {
     /// Run migrations, optionally seed from `GATEWAY_API_KEYS`, load cache.
     pub async fn init(pool: PgPool, seed_keys: Vec<String>) -> Result<Arc<Self>> {
-        sqlx::migrate!("migrations").run(&pool).await?;
+        sqlx::migrate!().run(&pool).await?;
 
         let store = Arc::new(KeyStore {
             pool: pool.clone(),
