@@ -4,6 +4,7 @@
 ##   make setup         — install Python deps with uv
 ##   make download      — pull model weights
 ##   make vllm          — start vLLM server
+##   make llamacpp      — start llama-cpp-python OpenAI server (GGUF models)
 ##   make gateway       — start Rust gateway (builds first)
 ##   make gpu-exporter  — start Rust GPU Prometheus exporter
 ##   make build-rust    — compile both Rust crates (release)
@@ -20,7 +21,7 @@ ENV_FILE  := $(ROOT_DIR)/config/.env
 CARGO     := $(shell which cargo 2>/dev/null || echo $(HOME)/.cargo/bin/cargo)
 RUST_MANIFEST := $(ROOT_DIR)/rust/Cargo.toml
 
-.PHONY: help setup download vllm gateway gpu-exporter build-rust \
+.PHONY: help setup download vllm llamacpp gateway gpu-exporter build-rust \
         monitoring monitoring-down loadtest status stop logs
 
 help:
@@ -44,6 +45,10 @@ download:
 # ── vLLM server ────────────────────────────────────────────────────────────
 vllm:
 	@bash scripts/launch_vllm.sh
+
+# ── llama-cpp-python server (GGUF models) ──────────────────────────────────
+llamacpp:
+	@bash scripts/launch_llamacpp.sh
 
 # ── Rust gateway (builds then runs) ────────────────────────────────────────
 gateway:
