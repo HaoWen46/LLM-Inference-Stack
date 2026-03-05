@@ -20,7 +20,7 @@ source "$ROOT_DIR/.venv/bin/activate"
 export HF_HOME="${MODEL_CACHE_DIR:-$ROOT_DIR/models}"
 
 # Redirect vLLM's torch_compile_cache and other caches away from home (limited quota)
-export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-/tmp2/b11902156/.cache/vllm}"
+export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-$ROOT_DIR/.cache/vllm}"
 mkdir -p "$VLLM_CACHE_ROOT"
 
 # Ensure consistent GPU indexing on mixed-GPU machines (4090 + 3090)
@@ -85,7 +85,9 @@ exec python3 -m vllm.entrypoints.openai.api_server \
     --port "${VLLM_PORT:-8000}" \
     --api-key "${VLLM_API_KEY}" \
     --uvicorn-log-level warning \
-    --disable-log-requests \
+    --no-enable-log-requests \
+    --tokenizer-mode slow \
+    --enforce-eager \
     ${ALLREDUCE_ARG} \
     ${GEN_CONFIG_ARG} \
     ${QUANT_ARGS} \

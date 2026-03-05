@@ -2,24 +2,22 @@
 name = "llm-inference-stack"
 version = "0.2.0"
 description = "Production LLM inference stack (Rust gateway + Python load tester)"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.13"
 dependencies = [
-    # vLLM — >=0.8.5 required for Qwen3 MoE + FP8 pre-quantized checkpoints
-    "vllm>=0.8.5",
-    # transformers pinned <5 — transformers 5.x broke Qwen tokenizer API used by vLLM 0.10
-    "transformers>=4.53.2,<5.0",
+    "vllm==0.16.0",
     # Load tester
-    "httpx[http2]==0.28.1",
-    "rich==13.9.4",
-    "typer==0.15.1",
-    "numpy==1.26.4",
+    "httpx[http2]>=0.28",
+    "rich>=13.9",
+    "typer>=0.15",
+    "numpy>=2.0",
     # Monitoring / scripts
-    "prometheus-client==0.21.1",
-    "structlog==24.4.0",
-    "python-dotenv==1.0.1",
-    "pydantic==2.10.3",
-    "pydantic-settings==2.7.0",
-    "aiofiles==24.1.0",
+    "prometheus-client>=0.21",
+    "structlog>=24.4",
+    "python-dotenv>=1.0",
+    "pydantic>=2.12.0",
+    "pydantic-settings>=2.7.0",
+    "aiofiles>=24.1",
+    "llama-cpp-python>=0.3.16",
 ]
 
 [project.scripts]
