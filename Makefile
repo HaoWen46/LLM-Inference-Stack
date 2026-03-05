@@ -17,7 +17,7 @@ SHELL     := bash
 ROOT_DIR  := $(shell pwd)
 UV        := $(shell which uv 2>/dev/null || echo $(HOME)/.local/bin/uv)
 ENV_FILE  := $(ROOT_DIR)/config/.env
-CARGO     := cargo
+CARGO     := $(shell which cargo 2>/dev/null || echo $(HOME)/.cargo/bin/cargo)
 RUST_MANIFEST := $(ROOT_DIR)/rust/Cargo.toml
 
 .PHONY: help setup download vllm gateway gpu-exporter build-rust \
