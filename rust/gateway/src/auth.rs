@@ -2,13 +2,13 @@ use axum::{
     extract::FromRequestParts,
     http::request::Parts,
 };
-use std::{collections::HashSet, sync::Arc};
-use subtle::ConstantTimeEq;
+use std::sync::Arc;
 
-use crate::{error::GatewayError, AppState};
+use crate::{error::GatewayError, keys::sha256_hex, AppState};
 
 /// Axum extractor that validates the Bearer token or `x-api-key` header.
 /// Injects the raw (plaintext) API key for downstream quota tracking.
+/// Hot path: SHA-256 hash then DashMap lookup — no database I/O, no await on DB.
 pub struct ApiKey(pub String);
 
 #[axum::async_trait]
@@ -19,46 +19,34 @@ impl FromRequestParts<Arc<AppState>> for ApiKey {
         parts: &mut Parts,
         state: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
-        match extract_token(parts) {
-            Some(key) => match ct_key_lookup(&key, &state.config.gateway_api_keys) {
-                Some(matched) => Ok(ApiKey(matched)),
-                None => {
-                    state.metrics.auth_failures.inc();
-                    Err(GatewayError::Unauthorized)
+        let raw_key = match extract_token(parts) {
+            Some(k) => k,
+            None => {
+                state.metrics.auth_failures.inc();
+                return Err(GatewayError::Unauthorized);
+            }
+        };
+
+        let hash = sha256_hex(&raw_key);
+        match state.key_store.lookup(&hash) {
+            Some(cached) => {
+                // Reject expired keys
+                if let Some(exp) = cached.expires_at {
+                    if exp < chrono::Utc::now() {
+                        state.metrics.auth_failures.inc();
+                        return Err(GatewayError::Unauthorized);
+                    }
                 }
-            },
+                // Fire-and-forget last_used_at update (does not block the hot path)
+                state.key_store.touch_last_used(cached.id);
+                Ok(ApiKey(raw_key))
+            }
             None => {
                 state.metrics.auth_failures.inc();
                 Err(GatewayError::Unauthorized)
             }
         }
     }
-}
-
-/// Constant-time key lookup: iterates over ALL keys without short-circuiting
-/// to prevent timing side-channels. Returns the matched stored key or None.
-fn ct_key_lookup(submitted: &str, valid_keys: &HashSet<String>) -> Option<String> {
-    let submitted_bytes = submitted.as_bytes();
-    let mut result: Option<String> = None;
-    let mut found = 0u8;
-
-    for stored in valid_keys {
-        let stored_bytes = stored.as_bytes();
-        // ct_eq requires same-length slices; length mismatch → 0 (constant-time).
-        let eq: u8 = if submitted_bytes.len() == stored_bytes.len() {
-            submitted_bytes.ct_eq(stored_bytes).unwrap_u8()
-        } else {
-            0u8
-        };
-        // Accumulate without branching on eq so all keys are always compared.
-        found |= eq;
-        // Record the match; the branch only runs for the correct key.
-        if eq == 1 && result.is_none() {
-            result = Some(stored.clone());
-        }
-    }
-
-    if found == 1 { result } else { None }
 }
 
 /// Extract the API key from `Authorization: Bearer <token>` or `x-api-key` header.

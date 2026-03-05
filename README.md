@@ -35,7 +35,7 @@ Sidecar processes
 | vLLM 0.16.0 | Python | Inference engine — paged attention, continuous batching, tensor parallelism |
 | **Axum 0.7** | **Rust** | **API gateway — zero-GC, predictable tail latency** |
 | **governor** | **Rust** | **Per-IP GCRA rate limiting** |
-| **sqlx + DashMap** | **Rust** | **Per-key daily token quota (SQLite backend)** |
+| **sqlx + DashMap** | **Rust** | **Per-key daily token quota (PostgreSQL backend)** |
 | **prometheus-client** | **Rust** | **Metrics exposition** |
 | Prometheus 2.55 | — | Metrics storage |
 | Grafana 11.3 | — | Dashboards and alerting |
@@ -105,7 +105,12 @@ VLLM_PORT=8000
 VLLM_API_KEY=change-me                  # internal secret between gateway and vLLM
 
 GATEWAY_PORT=8080
-GATEWAY_API_KEYS=key1,key2             # bearer tokens your clients will use
+DATABASE_URL=postgresql://gateway:changeme@localhost:5432/gateway
+ADMIN_KEY=admin-secret-change-me        # bearer token for /admin/* key management
+
+# Optional: if set and the DB has no keys, each entry is auto-inserted at startup.
+# After first run, manage keys via POST /admin/keys instead.
+GATEWAY_API_KEYS=key1,key2
 
 TP_SIZE=2                              # one shard per GPU
 DTYPE=bfloat16
@@ -156,12 +161,15 @@ Models are saved to `MODEL_CACHE_DIR/<repo-id>/` (configurable via `.env`).
 Open two terminal panes (or use tmux):
 
 ```bash
+# PostgreSQL (required for gateway key store and quota)
+make db
+
 # Pane 1 — inference engine
 make vllm
 # or directly:
 bash scripts/launch_vllm.sh
 
-# Pane 2 — API gateway (Rust; builds on first run ~60s)
+# Pane 2 — API gateway (Rust; builds on first run ~60s, migrations run automatically)
 make gateway
 ```
 
@@ -187,9 +195,16 @@ curl http://localhost:8080/health
 # Readiness (polls vLLM /health)
 curl http://localhost:8080/ready
 
+# Create an API key (only needed once; key is shown once in the response)
+curl -X POST http://localhost:8080/admin/keys \
+  -H "Authorization: Bearer $ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"label": "dev"}' | jq .
+# copy the "key" field → API_KEY=gw_...
+
 # Non-streaming chat
 curl http://localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer dev-key-1" \
+  -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "Qwen/Qwen3-30B-A3B",
@@ -199,7 +214,7 @@ curl http://localhost:8080/v1/chat/completions \
 
 # Streaming chat
 curl http://localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer dev-key-1" \
+  -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "Qwen/Qwen3-30B-A3B",
@@ -210,7 +225,7 @@ curl http://localhost:8080/v1/chat/completions \
 
 # Per-key token usage
 curl http://localhost:8080/v1/usage \
-  -H "Authorization: Bearer dev-key-1"
+  -H "Authorization: Bearer $API_KEY"
 ```
 
 ### 7. Load test
@@ -235,13 +250,18 @@ Outputs live stats (req/s, P50/P95/P99 latency, TTFT) and a final report.
 │   ├── Cargo.toml            ← workspace root
 │   ├── gateway/
 │   │   ├── Cargo.toml
+│   │   ├── migrations/
+│   │   │   ├── 001_api_keys.sql
+│   │   │   └── 002_token_usage.sql
 │   │   └── src/
 │   │       ├── main.rs       ← router, warmup, graceful shutdown
 │   │       ├── config.rs     ← Config::from_env()
-│   │       ├── auth.rs       ← ApiKey extractor (Bearer + x-api-key)
+│   │       ├── auth.rs       ← ApiKey extractor; SHA-256 hash → DashMap lookup
+│   │       ├── keys.rs       ← KeyStore: PgPool + DashMap cache, key generation
+│   │       ├── admin.rs      ← /admin/keys CRUD (ADMIN_KEY auth)
 │   │       ├── rate_limiter.rs ← DashMap<IpAddr, governor::RateLimiter>
 │   │       ├── circuit_breaker.rs ← lockless atomics (no Mutex)
-│   │       ├── quota.rs      ← DashMap cache + SQLite flush every 10s
+│   │       ├── quota.rs      ← DashMap cache + PostgreSQL flush every 10s
 │   │       ├── metrics.rs    ← prometheus-client Registry
 │   │       ├── proxy.rs      ← sync + SSE streaming proxy, TTFT
 │   │       ├── error.rs      ← GatewayError → HTTP status mapping
@@ -300,6 +320,7 @@ Outputs live stats (req/s, P50/P95/P99 latency, TTFT) and a final report.
 ```
 make setup          install Python deps into .venv via uv
 make download       pull model weights from HuggingFace
+make db             start PostgreSQL (required by gateway)
 make vllm           start vLLM (foreground, via scripts/launch_vllm.sh)
 make gateway        build + start Rust gateway (foreground)
 make gpu-exporter   build + start Rust GPU Prometheus exporter
@@ -315,10 +336,11 @@ make logs           tail Loki + Promtail container logs
 
 | Feature | Implementation |
 |---------|---------------|
-| Authentication | `Authorization: Bearer` or `X-API-Key`; constant-time comparison via `subtle` crate (no timing side-channels) |
+| Authentication | `Authorization: Bearer` or `X-API-Key`; SHA-256 hash → DashMap lookup (O(1), no DB I/O on hot path) |
+| Key management | PostgreSQL `api_keys` table; CRUD via `/admin/keys`; cache refreshed every 60s; plaintext never stored |
 | Rate limiting | Per-IP GCRA via `governor`; lazy `DashMap<IpAddr, Arc<RateLimiter>>`; background task evicts entries idle >1 hour |
 | Circuit breaker | Lockless `AtomicU8` state + `AtomicU64` failure counter; `compare_exchange` transitions |
-| Quota | `DashMap` in-memory cache (atomic fast path) flushed to SQLite every 10s; SHA-256 key hashing |
+| Quota | `DashMap` in-memory cache (atomic fast path) flushed to PostgreSQL every 10s; SHA-256 key hashing |
 | Request size limit | `DefaultBodyLimit::max(4 MB)` — oversized bodies rejected with 413 before parsing or auth |
 | Streaming | `reqwest::bytes_stream()` → line buffer → `tokio::mpsc` → `Body::from_stream`; injects `stream_options: {include_usage: true}` for exact token counts |
 | TTFT | Measured on first non-empty `data: ` SSE line; recorded as Prometheus histogram |
@@ -371,7 +393,7 @@ from openai import OpenAI
 
 client = OpenAI(
     base_url="http://localhost:8080/v1",
-    api_key="dev-key-1",
+    api_key="gw_...",   # key from POST /admin/keys
 )
 
 # Streaming
@@ -399,6 +421,10 @@ Authentication accepts both `Authorization: Bearer <key>` and `X-API-Key: <key>`
 | POST | `/v1/chat/completions` | ✓ | Chat completions (streaming or buffered) |
 | POST | `/v1/completions` | ✓ | Legacy completions |
 | GET | `/v1/usage` | ✓ | Per-key daily token usage |
+| POST | `/admin/keys` | Admin key | Create a key (plaintext shown once) |
+| GET | `/admin/keys` | Admin key | List all keys with metadata |
+| PATCH | `/admin/keys/:id` | Admin key | Enable or disable a key |
+| DELETE | `/admin/keys/:id` | Admin key | Delete a key permanently |
 
 ### `/v1/models/local` — discover models on disk
 
@@ -406,7 +432,7 @@ Returns every GGUF file and HuggingFace model directory found under `MODEL_CACHE
 
 ```bash
 curl http://localhost:8080/v1/models/local \
-  -H "Authorization: Bearer dev-key-1"
+  -H "Authorization: Bearer $API_KEY"
 ```
 
 ```json
@@ -470,7 +496,7 @@ vLLM is mocked with `respx`; the gateway's SQLite usage-DB is patched with `Asyn
 
 **Do not expose vLLM directly.** It has no auth and minimal error handling. Always route through the gateway.
 
-**API key security:** generate keys with `openssl rand -hex 32` and set them in `GATEWAY_API_KEYS`. The gateway warns at startup if placeholder keys (`dev-key-1`, `dev-key-2`) are still configured. Keys are compared in constant time via the `subtle` crate and stored as SHA-256 hashes in SQLite.
+**API key security:** create keys via `POST /admin/keys` (requires `ADMIN_KEY`). Keys are generated as `gw_<32-random-bytes-base64url>` and stored as SHA-256 hashes in PostgreSQL — plaintext is shown exactly once and never persisted. Set `ADMIN_KEY` to a strong random secret (`openssl rand -hex 32`).
 
 **NCCL hangs:** `TORCH_NCCL_BLOCKING_WAIT=1` is set in `scripts/launch_vllm.sh` so NCCL errors surface instead of hanging. `scripts/watchdog.py` can supervise and restart failed processes.
 

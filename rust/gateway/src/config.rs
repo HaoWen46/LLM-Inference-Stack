@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use std::collections::HashSet;
 
 /// All gateway configuration, loaded from environment variables at startup.
 /// The shell (or Docker env_file) is responsible for setting these — no dotenv parsing here.
@@ -14,8 +13,11 @@ pub struct Config {
     pub gateway_host: String,
     pub gateway_port: u16,
 
-    // ── Auth ─────────────────────────────────────────────────────────────────
-    pub gateway_api_keys: HashSet<String>,
+    // ── Database ─────────────────────────────────────────────────────────────
+    pub database_url: String,
+
+    // ── Admin ─────────────────────────────────────────────────────────────────
+    pub admin_key: String,
 
     // ── Rate limiting ────────────────────────────────────────────────────────
     pub rate_limit_per_minute: u32,
@@ -47,15 +49,10 @@ impl Config {
     pub fn from_env() -> Result<Self> {
         let vllm_api_key = std::env::var("VLLM_API_KEY")
             .context("VLLM_API_KEY is required")?;
-
-        let raw_keys = env_or("GATEWAY_API_KEYS", "dev-key-1");
-        let gateway_api_keys: HashSet<String> = raw_keys
-            .split(',')
-            .filter_map(|k| {
-                let k = k.trim().to_string();
-                if k.is_empty() { None } else { Some(k) }
-            })
-            .collect();
+        let database_url = std::env::var("DATABASE_URL")
+            .context("DATABASE_URL is required")?;
+        let admin_key = std::env::var("ADMIN_KEY")
+            .context("ADMIN_KEY is required")?;
 
         Ok(Config {
             vllm_url: env_or("VLLM_URL", "http://localhost:8000"),
@@ -63,7 +60,8 @@ impl Config {
             served_model_name: env_or("SERVED_MODEL_NAME", "llama-7b"),
             gateway_host: env_or("GATEWAY_HOST", "0.0.0.0"),
             gateway_port: env_u16("GATEWAY_PORT", 8080),
-            gateway_api_keys,
+            database_url,
+            admin_key,
             rate_limit_per_minute: env_u32("RATE_LIMIT_PER_MINUTE", 60),
             request_timeout_secs: env_u64("REQUEST_TIMEOUT_SECONDS", 300),
             connect_timeout_secs: env_u64("CONNECT_TIMEOUT_SECONDS", 5),

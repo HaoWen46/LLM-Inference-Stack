@@ -2,10 +2,12 @@
 //!
 //! Replaces the Python/FastAPI gateway with a zero-GC, single-binary server.
 //! Reads configuration exclusively from environment variables (no dotenv).
+mod admin;
 mod auth;
 mod circuit_breaker;
 mod config;
 mod error;
+mod keys;
 mod metrics;
 mod proxy;
 mod quota;
@@ -34,6 +36,7 @@ use crate::{
     circuit_breaker::CircuitBreaker,
     config::Config,
     error::GatewayError,
+    keys::KeyStore,
     metrics::AppMetrics,
     quota::QuotaStore,
     rate_limiter::RateLimiterMap,
@@ -48,6 +51,7 @@ pub struct AppState {
     pub circuit_breaker: Arc<CircuitBreaker>,
     pub rate_limiters: Arc<RateLimiterMap>,
     pub quota: Arc<QuotaStore>,
+    pub key_store: Arc<KeyStore>,
     pub metrics: Arc<AppMetrics>,
     /// Set to true once vLLM has responded healthy (warmup complete).
     pub warmed_up: Arc<AtomicBool>,
@@ -64,17 +68,26 @@ async fn main() -> anyhow::Result<()> {
 
     info!(version = env!("CARGO_PKG_VERSION"), "gateway starting");
 
-    // Warn if operator forgot to replace the example placeholder keys.
-    const DEFAULT_KEYS: &[&str] = &["dev-key-1", "dev-key-2"];
-    for k in DEFAULT_KEYS {
-        if config.gateway_api_keys.contains(*k) {
-            tracing::warn!(
-                key = k,
-                "SECURITY: GATEWAY_API_KEYS contains a default placeholder — \
-                 replace with a strong random secret before exposing to the internet"
-            );
-        }
-    }
+    // ── PostgreSQL connection pool ────────────────────────────────────────────
+    let pool = sqlx::PgPool::connect(&config.database_url).await?;
+    info!("connected to PostgreSQL");
+
+    // ── Key store (runs migrations, seeds from GATEWAY_API_KEYS if DB empty) ─
+    let seed_keys: Vec<String> = std::env::var("GATEWAY_API_KEYS")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|k| {
+            let k = k.trim().to_string();
+            if k.is_empty() { None } else { Some(k) }
+        })
+        .collect();
+
+    let key_store = KeyStore::init(pool.clone(), seed_keys).await?;
+    key_store.start_refresh_task();
+
+    // ── Quota store (PostgreSQL) ───────────────────────────────────────────────
+    let quota = QuotaStore::new(config.daily_token_quota, pool.clone()).await?;
+    quota.start_flush_task();
 
     // ── Metrics ──────────────────────────────────────────────────────────────
     let app_metrics = AppMetrics::new();
@@ -89,10 +102,6 @@ async fn main() -> anyhow::Result<()> {
     // ── Rate limiter ──────────────────────────────────────────────────────────
     let rate_limiters = Arc::new(RateLimiterMap::new(config.rate_limit_per_minute));
     rate_limiters.start_cleanup_task();
-
-    // ── Quota store (SQLite) ──────────────────────────────────────────────────
-    let quota = QuotaStore::new(config.daily_token_quota, "data/usage.db").await?;
-    quota.start_flush_task();
 
     // ── reqwest client — single shared connection pool ────────────────────────
     let client = reqwest::Client::builder()
@@ -112,6 +121,7 @@ async fn main() -> anyhow::Result<()> {
         circuit_breaker: circuit_breaker.clone(),
         rate_limiters,
         quota,
+        key_store,
         metrics: app_metrics.clone(),
         warmed_up: warmed_up.clone(),
         shutting_down: shutting_down.clone(),
@@ -177,6 +187,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/health", get(health_handler))
         .route("/ready", get(ready_handler))
         .route("/metrics", get(metrics_handler))
+        // ── Admin (ADMIN_KEY auth) ────────────────────────────────────────────
+        .nest("/admin", admin::router())
         // ── Authenticated ─────────────────────────────────────────────────────
         .route("/v1/usage", get(proxy::usage_handler))
         .route("/v1/models/local", get(proxy::local_models_handler))

@@ -22,7 +22,7 @@ CARGO     := $(shell which cargo 2>/dev/null || echo $(HOME)/.cargo/bin/cargo)
 RUST_MANIFEST := $(ROOT_DIR)/rust/Cargo.toml
 
 .PHONY: help setup download vllm llamacpp gateway gpu-exporter build-rust \
-        monitoring monitoring-down loadtest status stop logs
+        db monitoring monitoring-down loadtest status stop logs
 
 help:
 	@grep -E '^## ' Makefile | sed 's/## //'
@@ -64,6 +64,11 @@ gpu-exporter:
 build-rust:
 	$(CARGO) build --manifest-path $(RUST_MANIFEST) --release
 	@echo "[build-rust] Binaries at rust/target/release/{gateway,gpu-exporter}"
+
+# ── PostgreSQL (API key + quota store) ─────────────────────────────────────
+db:
+	@docker compose -f docker/docker-compose.yml up -d postgres
+	@echo "PostgreSQL: localhost:5432  (user: gateway)"
 
 # ── Monitoring stack ────────────────────────────────────────────────────────
 monitoring:

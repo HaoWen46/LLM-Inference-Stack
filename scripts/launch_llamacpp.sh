@@ -19,23 +19,38 @@ LLAMACPP_MODEL="${LLAMACPP_MODEL:-}"
 LLAMACPP_PORT="${LLAMACPP_PORT:-8001}"
 LLAMACPP_GPU_LAYERS="${LLAMACPP_GPU_LAYERS:--1}"   # -1 = all layers on GPU
 LLAMACPP_CTX="${LLAMACPP_CTX:-8192}"
-LLAMACPP_HOST="${LLAMACPP_HOST:-0.0.0.0}"
+# Bind to localhost only — external access must go through the Rust gateway on :8080
+LLAMACPP_HOST="${LLAMACPP_HOST:-127.0.0.1}"
+LLAMACPP_API_KEY="${LLAMACPP_API_KEY:-}"
 
 if [[ -z "$LLAMACPP_MODEL" ]]; then
   echo "[llamacpp] ERROR: LLAMACPP_MODEL is not set."
   echo "  Set it in config/.env or pass it as an environment variable."
-  echo "  Example: LLAMACPP_MODEL=/tmp/user/models/Qwen/Qwen3-1.7B-GGUF/Qwen3-1.7B-Q8_0.gguf"
+  echo "  Example: LLAMACPP_MODEL=/home5/user/models/Qwen/Qwen3-1.7B-GGUF/Qwen3-1.7B-Q8_0.gguf"
   exit 1
 fi
 
+if [[ -z "$LLAMACPP_API_KEY" ]]; then
+  echo "[llamacpp] WARNING: LLAMACPP_API_KEY is not set — server will accept unauthenticated requests."
+  echo "  Set LLAMACPP_API_KEY in config/.env to require a Bearer token."
+fi
+
 echo "[llamacpp] Model:      $LLAMACPP_MODEL"
+echo "[llamacpp] Host:       $LLAMACPP_HOST"
 echo "[llamacpp] Port:       $LLAMACPP_PORT"
 echo "[llamacpp] GPU layers: $LLAMACPP_GPU_LAYERS"
 echo "[llamacpp] Context:    $LLAMACPP_CTX"
+echo "[llamacpp] Auth:       ${LLAMACPP_API_KEY:+enabled (key set)}${LLAMACPP_API_KEY:-DISABLED — set LLAMACPP_API_KEY}"
+
+API_KEY_ARG=""
+if [[ -n "$LLAMACPP_API_KEY" ]]; then
+  API_KEY_ARG="--api_key $LLAMACPP_API_KEY"
+fi
 
 exec uv run python3 -m llama_cpp.server \
   --model "$LLAMACPP_MODEL" \
   --n_gpu_layers "$LLAMACPP_GPU_LAYERS" \
   --n_ctx "$LLAMACPP_CTX" \
   --host "$LLAMACPP_HOST" \
-  --port "$LLAMACPP_PORT"
+  --port "$LLAMACPP_PORT" \
+  ${API_KEY_ARG}

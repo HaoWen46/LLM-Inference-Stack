@@ -81,7 +81,7 @@ exec python3 -m vllm.entrypoints.openai.api_server \
     --max-num-seqs "${MAX_NUM_SEQS:-256}" \
     --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS:-8192}" \
     --swap-space "${SWAP_SPACE_GB:-8}" \
-    --host "${VLLM_HOST:-0.0.0.0}" \
+    --host "${VLLM_HOST:-127.0.0.1}" \
     --port "${VLLM_PORT:-8000}" \
     --api-key "${VLLM_API_KEY}" \
     --uvicorn-log-level warning \
