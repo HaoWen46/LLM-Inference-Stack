@@ -71,6 +71,9 @@ make setup
 
 # Install Rust (for gateway + gpu-exporter)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+# If /tmp is mounted noexec (common on cluster nodes), rustup unpacking fails.
+# Work around it by pointing TMPDIR at a writable directory first:
+#   mkdir -p ~/.tmp && TMPDIR=~/.tmp sh rustup-init.sh -y
 ```
 
 > **vLLM compile cache:** vLLM writes `torch_compile_cache` to `~/.cache/vllm` by
@@ -422,7 +425,8 @@ curl http://localhost:8080/v1/models/local \
 
 Scans two layouts:
 - **GGUF files** — any `*.gguf` found recursively; `id` is the path relative to `MODEL_CACHE_DIR`
-- **HuggingFace dirs** — `<org>/<repo>` directories under `MODEL_CACHE_DIR`
+- **HuggingFace Hub cache** — `models--<org>--<repo>` directories created by `huggingface_hub`
+- **Flat org/repo dirs** — plain `<org>/<repo>` directories (e.g. `/tmp/user/models/Qwen/Qwen3-30B-A3B`) detected by checking for `config.json` in subdirectories
 
 ### Error format
 
@@ -474,7 +478,7 @@ vLLM is mocked with `respx`; the gateway's SQLite usage-DB is patched with `Asyn
 
 **CUDA device order:** Set `CUDA_DEVICE_ORDER=PCI_BUS_ID` (default in `launch_vllm.sh`) for consistent device indexing. Override `CUDA_VISIBLE_DEVICES` in `.env` to pin specific GPUs.
 
-**Cold start:** vLLM compiles Triton kernels and runs torch.compile on first-ever launch. This is cached in `.cache/vllm/` inside the project directory. Expect 15–20 minutes on first run; subsequent starts take ~30 seconds.
+**Cold start and torch.compile:** `launch_vllm.sh` passes `--enforce-eager` which **skips torch.compile entirely**. This avoids an indefinite hang observed on this hardware (workers consumed 46 GB VRAM at 0% utilization for 7+ hours). Triton kernels are still compiled on first run and cached in `.triton_cache/` in the project root; subsequent starts take ~30 seconds. Remove `--enforce-eager` in `VLLM_EXTRA_ARGS` if you want to benchmark torch.compile on a fresh system.
 
 **Slow tokenizer:** `--tokenizer-mode slow` is set in `launch_vllm.sh` to work around a compatibility issue between the fast tokenizer backend (`tokenizers` Rust library) and vLLM 0.16.0. Remove this flag if a future vLLM release resolves it.
 
