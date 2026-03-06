@@ -16,6 +16,23 @@ fi
 # Activate venv
 source "$ROOT_DIR/.venv/bin/activate"
 
+# ── cublas fix ──────────────────────────────────────────────────────────────
+# torch 2.10.0 bundles nvidia-cublas-cu12==12.8.4.1 which breaks all BF16
+# GEMMs on Ampere (CC 8.6) when the CUDA driver is 12.9+.
+# Fix: upgrade to 12.9.1.4.  Checked on every launch; takes <1s if already
+# correct, ~5s to install if not (e.g. after a fresh uv sync).
+_CUBLAS_NEED="12.9.1.4"
+_CUBLAS_HAVE=$(python3 -c \
+    "import importlib.metadata; print(importlib.metadata.version('nvidia-cublas-cu12'))" \
+    2>/dev/null || echo "unknown")
+if [[ "$_CUBLAS_HAVE" != "$_CUBLAS_NEED" ]]; then
+    echo "[vllm] cublas fix: nvidia-cublas-cu12 ${_CUBLAS_HAVE} → ${_CUBLAS_NEED}"
+    pip install --quiet "nvidia-cublas-cu12==${_CUBLAS_NEED}" --no-deps
+else
+    echo "[vllm] cublas OK: nvidia-cublas-cu12==${_CUBLAS_HAVE}"
+fi
+unset _CUBLAS_NEED _CUBLAS_HAVE
+
 # HF cache — HF_HOME is the current standard; TRANSFORMERS_CACHE is deprecated in v5
 export HF_HOME="${MODEL_CACHE_DIR:-$ROOT_DIR/models}"
 
@@ -64,6 +81,14 @@ GEN_CONFIG_ARG="--generation-config vllm"
 PREFIX_CACHE_ARG="--enable-prefix-caching"
 CHUNKED_PREFILL_ARG="--enable-chunked-prefill"
 
+# Qwen3.5 is a VL model; we run text-only. Cap vision inputs at 0 to prevent
+# the vision encoder from being called with empty inputs during the profile run,
+# which triggers a 0-size BF16 GEMM on TP>1 (CUBLAS_STATUS_INVALID_VALUE).
+VISION_ARG=""
+if [[ "${LIMIT_MM_PER_PROMPT:-}" != "" ]]; then
+    VISION_ARG="--limit-mm-per-prompt ${LIMIT_MM_PER_PROMPT}"
+fi
+
 echo "[vllm] Starting model: ${MODEL_NAME}"
 echo "[vllm] TP size: ${TP_SIZE}"
 echo "[vllm] Quantization: ${QUANTIZATION:-none}"
@@ -93,4 +118,5 @@ exec python3 -m vllm.entrypoints.openai.api_server \
     ${QUANT_ARGS} \
     ${PREFIX_CACHE_ARG} \
     ${CHUNKED_PREFILL_ARG} \
+    ${VISION_ARG} \
     ${VLLM_EXTRA_ARGS:-}
