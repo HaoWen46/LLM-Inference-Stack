@@ -72,7 +72,10 @@ fi
 
 # ── Full repo snapshot via huggingface_hub ────────────────────────────────────
 cd "$ROOT_DIR"
-uv run python3 - <<EOF
+
+if [[ -z "$STAGE_DIR" ]]; then
+    # No staging: download directly to final destination in one shot
+    uv run python3 - <<EOF
 import os
 from huggingface_hub import snapshot_download
 
@@ -89,14 +92,51 @@ path = snapshot_download(
 )
 print(f"Saved to: {path}")
 EOF
-
-if [[ -n "$STAGE_DIR" ]]; then
+else
+    # Staging mode: download each file to fast scratch, move to NFS immediately,
+    # so the slow NFS write overlaps with the next file downloading.
     STAGE_MODEL_DIR="$WORK_DIR/$MODEL_NAME"
     FINAL_MODEL_DIR="$FINAL_DIR/$MODEL_NAME"
-    mkdir -p "$FINAL_MODEL_DIR"
-    echo "[download] Syncing $STAGE_MODEL_DIR -> $FINAL_MODEL_DIR"
-    rsync -a --info=progress2 "$STAGE_MODEL_DIR/" "$FINAL_MODEL_DIR/"
-    echo "[download] Cleaning up stage..."
-    rm -rf "$STAGE_MODEL_DIR"
-    echo "[download] Done: $FINAL_MODEL_DIR"
+    mkdir -p "$STAGE_MODEL_DIR" "$FINAL_MODEL_DIR"
+
+    uv run python3 - <<EOF
+import os, fnmatch, shutil
+from huggingface_hub import list_repo_files, hf_hub_download
+
+token      = os.environ.get("HF_TOKEN") or None
+model      = "$MODEL_NAME"
+stage_dir  = "$STAGE_MODEL_DIR"
+final_dir  = "$FINAL_MODEL_DIR"
+ignore     = ["*.msgpack", "flax_model*", "tf_model*", "*.ot", "rust_model*"]
+
+print(f"Listing files for {model}...")
+all_files = list(list_repo_files(model, token=token))
+files = [f for f in all_files if not any(fnmatch.fnmatch(f, pat) for pat in ignore)]
+print(f"Found {len(files)} files ({len(all_files) - len(files)} ignored)")
+
+for i, filename in enumerate(files, 1):
+    dest = os.path.join(final_dir, filename)
+    if os.path.exists(dest):
+        print(f"[{i}/{len(files)}] skip (exists): {filename}")
+        continue
+
+    print(f"[{i}/{len(files)}] downloading : {filename}")
+    stage_path = hf_hub_download(
+        repo_id=model,
+        filename=filename,
+        local_dir=stage_dir,
+        token=token,
+    )
+
+    dest_dir = os.path.dirname(dest)
+    if dest_dir:
+        os.makedirs(dest_dir, exist_ok=True)
+
+    shutil.move(stage_path, dest)
+    print(f"[{i}/{len(files)}] moved       : {filename}")
+
+# Clean up any leftover empty dirs / metadata in staging
+shutil.rmtree(stage_dir, ignore_errors=True)
+print(f"Done: {final_dir}")
+EOF
 fi

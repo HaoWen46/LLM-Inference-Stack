@@ -28,19 +28,29 @@ bash scripts/launch_vllm.sh >> .cache/vllm.log 2>&1 &
 
 Key behaviors:
 - Loads `config/.env` with `set -a` so all vars are exported to vLLM
+- Activates `.venv` directly (not via `uv run`) — this is intentional so manual package overrides like the cublas fix are not reverted
 - Sets `HF_HOME` to `MODEL_CACHE_DIR` so HF Hub cache is on the right disk
 - Redirects vLLM's compile cache to `.cache/vllm/` (avoids home quota pressure)
 - Sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` for consistent GPU ordering on mixed fleets
 - Disables NVIDIA custom all-reduce (no NVLink on consumer GPUs)
 - Passes `--enforce-eager` (required on this machine — torch.compile hangs)
-- Passes `--tokenizer-mode slow` (required for Qwen3 tokenizer)
+- Passes `--tokenizer-mode slow` (Qwen3.5 tokenizer needs `all_special_tokens_extended`, which the fast tokenizer Rust lib dropped)
 - Enables prefix caching and chunked prefill
+- Passes `--limit-mm-per-prompt` when `LIMIT_MM_PER_PROMPT` is set (required for VL models running text-only)
+- Appends `VLLM_EXTRA_ARGS` verbatim (use for `--reasoning-parser qwen3`, etc.)
 
 **Required env vars** (must be in `config/.env`):
 ```
-MODEL_NAME          HuggingFace repo ID (e.g. Qwen/Qwen3-30B-A3B)
+MODEL_NAME          Local path to weights, e.g. /home5/user/models/Qwen/Qwen3.5-35B-A3B
+                    (use the full local path, not the HF repo ID, to prevent re-downloading)
 VLLM_API_KEY        Internal Bearer token (gateway uses this to talk to vLLM)
 TP_SIZE             Tensor parallel degree (1 or 2)
+```
+
+**Optional env vars:**
+```
+LIMIT_MM_PER_PROMPT   e.g. '{"image":0,"video":0}' — disable vision for VL models
+VLLM_EXTRA_ARGS       e.g. '--reasoning-parser qwen3' — appended as-is to the server args
 ```
 
 ---
@@ -89,7 +99,7 @@ bash scripts/download_model.sh Org/Repo-GGUF filename.q8_0.gguf
 
 **Two-stage download** (recommended when `MODEL_CACHE_DIR` is on slow NFS):
 
-Set `MODEL_STAGE_DIR` to a fast local path (e.g. `/tmp/$USER/models`). The script downloads to staging first, then rsyncs to the final destination and cleans up. Leave `MODEL_STAGE_DIR` unset to download directly to `MODEL_CACHE_DIR`.
+Set `MODEL_STAGE_DIR` to a fast local path (e.g. `/tmp/$USER/models`). Each file is downloaded to staging and immediately moved to `MODEL_CACHE_DIR` before the next file starts, so staging disk usage stays minimal throughout. If a download is interrupted, re-running skips files that already exist at the final destination. Leave `MODEL_STAGE_DIR` unset to download directly to `MODEL_CACHE_DIR`.
 
 Skips PyTorch/Flax/TF weights and Rust model files during full repo downloads.
 
@@ -120,7 +130,7 @@ uv run python scripts/write_kernel_configs.py
 ```
 
 Generates configs for:
-- FP8 block GEMM shapes used by Qwen3-30B-A3B-FP8 (`N=2048,K=2048` and `N=2560,K=2048`)
+- FP8 block GEMM shapes used by Qwen3/Qwen3.5 FP8 variants (`N=2048,K=2048` and `N=2560,K=2048`)
 - FP8 MoE fused kernel (E=128 experts, N_intermediate=384)
 
 Configs are derived from H100/H20 patterns, adapted for Ada Lovelace (sm_89 / RTX 4090). They provide per-batch-size `BLOCK_SIZE_M` selection across 18 batch sizes from 1 to 4096.

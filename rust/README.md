@@ -128,12 +128,12 @@ curl -X DELETE http://localhost:8080/admin/keys/<id> \
 GATEWAY_HOST=localhost:8080
 API_KEY=gw_...   # obtained from POST /admin/keys
 
-# Chat completion (streaming)
+# Chat completion (streaming; Qwen3.5 is a reasoning model — thinking arrives before answer)
 curl -X POST http://$GATEWAY_HOST/v1/chat/completions \
   -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "Qwen/Qwen3-30B-A3B",
+    "model": "Qwen/Qwen3.5-35B-A3B",
     "messages": [{"role": "user", "content": "Hello"}],
     "stream": true
   }'

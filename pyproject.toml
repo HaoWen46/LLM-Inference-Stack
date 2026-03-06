@@ -4,7 +4,7 @@ version = "0.2.0"
 description = "Production LLM inference stack (Rust gateway + Python load tester)"
 requires-python = ">=3.10,<3.13"
 dependencies = [
-    "vllm==0.16.0",
+    "vllm==0.17.0rc1.dev114+g2a00d3241",
     # Load tester
     "httpx[http2]>=0.28",
     "rich>=13.9",
@@ -49,6 +49,15 @@ packages = ["llm_inference_stack"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[[tool.uv.index]]
+name = "vllm-nightly"
+url = "https://wheels.vllm.ai/nightly"
+
+[tool.uv]
+override-dependencies = [
+    "nvidia-cublas-cu12==12.9.1.4",
+]
 
 [build-system]
 requires = ["hatchling"]

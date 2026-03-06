@@ -40,7 +40,7 @@ The first `make gateway` compiles Rust from source (~60s). Subsequent runs start
 
 ```
 Client → NGINX (optional TLS) → Gateway :8080 (Rust/Axum)
-                                     → vLLM :8000 → GPU 0 + GPU 1
+                                     → vLLM :8000 → GPU 0 + GPU 1  (Qwen3.5-35B-A3B, TP=2)
 
 Sidecar: gpu-exporter :9101 → Prometheus :9090 → Grafana :3000
          Jaeger :16686 (OTLP tracing)
@@ -104,5 +104,8 @@ The gateway is OpenAI-compatible (`/v1/chat/completions`, `/v1/completions`, `/v
 - **KV cache pressure**: If `vllm:gpu_cache_usage_perc` > 90%, lower `MAX_MODEL_LEN` or `MAX_NUM_SEQS`. Alerts fire at 85%.
 - **Cold start**: vLLM compiles Triton kernels on first-ever run; results are cached in `.triton_cache/`. The gateway's `/ready` endpoint blocks until vLLM is healthy.
 - **NCCL hangs**: `TORCH_NCCL_BLOCKING_WAIT=1` is set in `scripts/launch_vllm.sh` so errors surface instead of hanging. `scripts/watchdog.py` can supervise and restart failed processes.
-- **Memory budget quick ref** (144GB total VRAM — 3× RTX A6000 48GB): 7B bf16 ≈ 14GB weights; 30B bf16 ≈ 60GB weights (TP=2 fits easily); 70B AWQ int4 ≈ 35GB weights.
+- **Memory budget quick ref** (144GB total VRAM — 3× RTX A6000 48GB): 7B bf16 ≈ 14GB weights; 35B bf16 ≈ 70GB weights (TP=2, ~33GB/GPU + KV headroom); 70B AWQ int4 ≈ 35GB weights.
+- **BF16 GEMM fix**: torch 2.10.0 + `nvidia-cublas-cu12==12.8.4.1` + CUDA driver 12.9 breaks all BF16 GEMMs on Ampere (CC 8.6). `launch_vllm.sh` auto-upgrades to `12.9.1.4` on every launch (idempotent). If you need to fix it manually: `uv pip install "nvidia-cublas-cu12==12.9.1.4" --no-deps`.
+- **VL model text-only**: Qwen3.5-35B-A3B is a vision-language model. `LIMIT_MM_PER_PROMPT='{"image":0,"video":0}'` in `.env` keeps the vision encoder from running during the profile pass (prevents another CUBLAS error with 0-row GEMM on TP>1).
+- **vLLM nightly rotation**: the nightly wheel server only keeps the latest build. If `uv sync` fails with "version not found", update the vllm pin in `pyproject.toml` to the current nightly version from `wheels.vllm.ai/nightly`.
 - **`make stop` safety**: never use `pkill -f <pattern>` in scripts — the pattern literal lives in the shell's argv and causes self-termination. Use `pgrep -x <name>` for Rust binaries, `pgrep -f 'vllm[.]entrypoints'` (the `[.]` trick), and `pgrep 'VLLM'` for worker processes.
