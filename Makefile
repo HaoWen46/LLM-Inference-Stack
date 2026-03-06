@@ -11,7 +11,9 @@
 ##   make monitoring    — start Prometheus + Grafana + Jaeger + Loki via docker-compose
 ##   make loadtest      — run load test against gateway
 ##   make status        — show running processes and GPU state
-##   make stop          — gracefully stop all background processes
+##   make stop          — gracefully stop gateway / vLLM / gpu-exporter
+##   make db-stop       — stop PostgreSQL (Docker or user-space pgenv)
+##   make stop-all      — stop + db-stop (everything)
 ##   make logs          — tail Loki + Promtail container logs
 
 SHELL     := bash
@@ -22,7 +24,7 @@ CARGO     := $(shell which cargo 2>/dev/null || echo $(HOME)/.cargo/bin/cargo)
 RUST_MANIFEST := $(ROOT_DIR)/rust/Cargo.toml
 
 .PHONY: help setup download vllm llamacpp gateway gpu-exporter build-rust \
-        db monitoring monitoring-down loadtest status stop logs
+        db db-stop monitoring monitoring-down loadtest status stop stop-all logs
 
 help:
 	@grep -E '^## ' Makefile | sed 's/## //'
@@ -154,6 +156,30 @@ stop:
 	  _kill KILL $$(pgrep -f 'llama_cpp[.]server' 2>/dev/null); \
 	}
 	@echo "Stopped."
+
+# ── Stop PostgreSQL ────────────────────────────────────────────────────────
+# Handles two deployment modes:
+#   • Docker:     docker compose stop postgres
+#   • User-space: pg_ctl stop via ~/.local/share/pgenv (no root needed)
+db-stop:
+	@echo "Stopping PostgreSQL..."
+	@{ \
+	  stopped=0; \
+	  if docker compose -f docker/docker-compose.yml ps --services --filter status=running 2>/dev/null | grep -q '^postgres$$'; then \
+	    docker compose -f docker/docker-compose.yml stop postgres; \
+	    stopped=1; \
+	  fi; \
+	  PGCTL="$$HOME/.local/share/pgenv/bin/pg_ctl"; \
+	  PGDATA="$$HOME/.local/share/pgdata"; \
+	  if [ -x "$$PGCTL" ] && "$$PGCTL" status -D "$$PGDATA" >/dev/null 2>&1; then \
+	    "$$PGCTL" stop -D "$$PGDATA" -m fast; \
+	    stopped=1; \
+	  fi; \
+	  [ $$stopped -eq 0 ] && echo "  PostgreSQL was not running." || echo "  PostgreSQL stopped."; \
+	}
+
+# ── Stop everything ────────────────────────────────────────────────────────
+stop-all: stop db-stop
 
 # ── Log tailing ────────────────────────────────────────────────────────────
 logs:
