@@ -31,6 +31,9 @@ pub enum GatewayError {
     #[error("Invalid request: {0}")]
     BadRequest(String),
 
+    #[error("Not found: {0}")]
+    NotFound(String),
+
     #[error("Service is shutting down")]
     ShuttingDown,
 
@@ -59,6 +62,7 @@ impl IntoResponse for GatewayError {
             GatewayError::UpstreamTimeout => StatusCode::GATEWAY_TIMEOUT,
             GatewayError::UpstreamError(_) => StatusCode::SERVICE_UNAVAILABLE,
             GatewayError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            GatewayError::NotFound(_) => StatusCode::NOT_FOUND,
             GatewayError::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
             GatewayError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -79,6 +83,10 @@ impl IntoResponse for GatewayError {
             ),
             GatewayError::BadRequest(msg) => (
                 format!("Invalid request: {}", msg),
+                "invalid_request_error",
+            ),
+            GatewayError::NotFound(msg) => (
+                format!("Not found: {}", msg),
                 "invalid_request_error",
             ),
             GatewayError::UpstreamError(_) => (

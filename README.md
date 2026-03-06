@@ -4,7 +4,7 @@ Production-grade LLM serving on 3× NVIDIA RTX A6000 (144 GB total VRAM).
 
 Built on [vLLM](https://github.com/vllm-project/vllm) with a **Rust/Axum gateway**, Prometheus metrics, and Grafana dashboards.
 
-**Current deployment:** `Qwen/Qwen3-30B-A3B` (BF16) on GPUs 0 & 1 (A6000, TP=2).
+**Current deployment:** `Qwen/Qwen3.5-35B-A3B` (BF16, reasoning model) on GPUs 0 & 1 (A6000, TP=2).
 
 ## Architecture
 
@@ -32,7 +32,7 @@ Sidecar processes
 
 | Component | Language | Purpose |
 |-----------|----------|---------|
-| vLLM 0.16.0 | Python | Inference engine — paged attention, continuous batching, tensor parallelism |
+| vLLM 0.17.0 nightly | Python | Inference engine — paged attention, continuous batching, tensor parallelism |
 | **Axum 0.7** | **Rust** | **API gateway — zero-GC, predictable tail latency** |
 | **governor** | **Rust** | **Per-IP GCRA rate limiting** |
 | **sqlx + DashMap** | **Rust** | **Per-key daily token quota (PostgreSQL backend)** |
@@ -48,8 +48,8 @@ The Python FastAPI gateway (`gateway/`) is kept as a reference implementation an
 
 | # | GPU | VRAM | Notes |
 |---|-----|------|-------|
-| 0 | NVIDIA RTX A6000 | 48 GB | **active — Qwen3-30B shard 0** |
-| 1 | NVIDIA RTX A6000 | 48 GB | **active — Qwen3-30B shard 1** |
+| 0 | NVIDIA RTX A6000 | 48 GB | **active — Qwen3.5-35B shard 0** |
+| 1 | NVIDIA RTX A6000 | 48 GB | **active — Qwen3.5-35B shard 1** |
 | 2 | NVIDIA RTX A6000 | 48 GB | available |
 
 - **RAM:** 128 GB system
@@ -97,9 +97,11 @@ vim config/.env
 Key values:
 
 ```bash
-MODEL_NAME=/tmp/B11902156/models/Qwen/Qwen3-30B-A3B
-SERVED_MODEL_NAME=Qwen/Qwen3-30B-A3B
-MODEL_CACHE_DIR=/tmp/B11902156/models   # scanned by GET /v1/models/local
+# Use the full local path for MODEL_NAME — avoids HuggingFace re-downloading
+# weights that are already on disk when you restart vLLM.
+MODEL_NAME=/home5/B11902156/models/Qwen/Qwen3.5-35B-A3B
+SERVED_MODEL_NAME=Qwen/Qwen3.5-35B-A3B
+MODEL_CACHE_DIR=/home5/B11902156/models   # scanned by GET /v1/models/local
 
 VLLM_PORT=8000
 VLLM_API_KEY=change-me                  # internal secret between gateway and vLLM
@@ -143,7 +145,7 @@ MAX_MODEL_LEN=8192
 ```bash
 make download
 # or explicitly (full HF repo):
-bash scripts/download_model.sh Qwen/Qwen3-30B-A3B
+bash scripts/download_model.sh Qwen/Qwen3.5-35B-A3B
 
 # single GGUF file (bypasses huggingface_hub / hf_xet):
 bash scripts/download_model.sh TheBloke/Mistral-7B-v0.1-GGUF mistral-7b-v0.1.Q8_0.gguf
@@ -151,10 +153,15 @@ bash scripts/download_model.sh TheBloke/Mistral-7B-v0.1-GGUF mistral-7b-v0.1.Q8_
 
 Models are saved to `MODEL_CACHE_DIR/<repo-id>/` (configurable via `.env`).
 
-> **Model compatibility:** vLLM 0.16.0 requires `transformers<5`. Very new model
-> architectures (e.g. `qwen3_5_moe`, `glm4_moe_lite`) only land in transformers 5.x
-> and require the vLLM nightly wheel. Use established architectures (Qwen3, Llama,
-> Mistral, DeepSeek-R1-Distill) with the stable release.
+> **Model compatibility:** Newer architectures like `qwen3_5_moe` (Qwen3.5) require
+> vLLM ≥ 0.17.0. This stack runs the nightly wheel to support them. Stable
+> architectures (Qwen3, Llama, Mistral, DeepSeek-R1-Distill) work with the stable
+> 0.16 release.
+>
+> **Vision-language models (VL) run text-only:** Qwen3.5-35B-A3B is a VL model.
+> Set `LIMIT_MM_PER_PROMPT='{"image":0,"video":0}'` in `.env` so the vision
+> encoder is never invoked during the profile run — otherwise TP > 1 causes a
+> CUBLAS error on 0-row BF16 GEMMs.
 
 ### 4. Run the stack
 
@@ -213,7 +220,7 @@ curl http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "Qwen/Qwen3-30B-A3B",
+    "model": "Qwen/Qwen3.5-35B-A3B",
     "messages": [{"role": "user", "content": "What is tensor parallelism?"}],
     "max_tokens": 256
   }'
@@ -223,7 +230,7 @@ curl http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "Qwen/Qwen3-30B-A3B",
+    "model": "Qwen/Qwen3.5-35B-A3B",
     "messages": [{"role": "user", "content": "Explain MoE briefly."}],
     "max_tokens": 256,
     "stream": true
@@ -287,8 +294,8 @@ Outputs live stats (req/s, P50/P95/P99 latency, TTFT) and a final report.
 │   └── usage_db.py
 │
 ├── scripts/
-│   ├── launch_vllm.sh        ← starts vLLM with settings from .env (uses uv run)
-│   ├── download_model.sh     ← HF snapshot_download (uv run) or single-file wget for GGUF
+│   ├── launch_vllm.sh        ← starts vLLM with settings from .env (activates .venv directly)
+│   ├── download_model.sh     ← file-by-file HF download with optional staging dir; or single-file wget for GGUF
 │   ├── write_kernel_configs.py ← generate heuristic Triton configs (instant, no GPU)
 │   ├── tune_kernels.py       ← benchmark-tune Triton configs on a free GPU
 │   ├── gpu_exporter.py       ← Python GPU exporter (replaced by Rust)
@@ -313,6 +320,11 @@ Outputs live stats (req/s, P50/P95/P99 latency, TTFT) and a final report.
 │   ├── Dockerfile.gateway          ← Python gateway (fallback)
 │   ├── Dockerfile.vllm
 │   └── docker-compose.yml
+│
+├── examples/
+│   ├── client.py             ← interactive CLI client; key from .env or --key flag
+│   ├── test_gateway.py       ← end-to-end smoke tests (auth, streaming, reasoning mode)
+│   └── test_api.py           ← API integration tests (70 checks, no inference needed for most)
 │
 ├── tests/
 │   ├── conftest.py           ← fixtures: mock vLLM (respx), ASGI transport, DB stubs
@@ -363,7 +375,7 @@ Reference for RTX A6000 (48 GB VRAM each):
 
 | Model | Precision | Weights/GPU (TP=2) | KV headroom | Notes |
 |-------|-----------|-------------------|-------------|-------|
-| Qwen3-30B-A3B | bf16 | ~28 GB | ~18 GB | **current; 2× A6000** |
+| Qwen3.5-35B-A3B | bf16 | ~33 GB | ~13 GB | **current; 2× A6000** |
 | 7B | bf16 | ~7 GB | ~39 GB | single GPU |
 | 13B | bf16 | ~13 GB | ~35 GB | single GPU |
 | 70B | bf16 | ~35 GB | ~13 GB | TP=2 |
@@ -403,9 +415,9 @@ client = OpenAI(
     api_key="gw_...",   # key from POST /admin/keys
 )
 
-# Streaming
+# Streaming (Qwen3.5 is a reasoning model — thinking tokens arrive first)
 stream = client.chat.completions.create(
-    model="Qwen/Qwen3-30B-A3B",
+    model="Qwen/Qwen3.5-35B-A3B",
     messages=[{"role": "user", "content": "Explain paged attention."}],
     max_tokens=512,
     stream=True,
@@ -415,6 +427,14 @@ for chunk in stream:
 ```
 
 Authentication accepts both `Authorization: Bearer <key>` and `X-API-Key: <key>` headers.
+
+**Qwen3.5 thinking mode:** by default the model reasons before answering (thinking tokens are separated into the `reasoning` field by vLLM's `--reasoning-parser qwen3`; the final answer is in `content`). To skip thinking and get an instant answer, pass:
+
+```python
+extra_body={"chat_template_kwargs": {"enable_thinking": False}}
+```
+
+or in raw JSON: `"chat_template_kwargs": {"enable_thinking": false}` at the top level of the request body.
 
 ### Endpoints
 
@@ -447,7 +467,7 @@ curl http://localhost:8080/v1/models/local \
   "object": "list",
   "data": [
     {
-      "id": "Qwen/Qwen3-30B-A3B",
+      "id": "Qwen/Qwen3.5-35B-A3B",
       "object": "model",
       "owned_by": "local",
       "format": "hf"
@@ -480,12 +500,14 @@ All errors use the OpenAI error schema so standard SDK exception handling works 
 |-------------|--------|
 | 401 | `authentication_error` |
 | 400 / 422 | `invalid_request_error` |
+| 404 | `invalid_request_error` |
+| 413 | `invalid_request_error` |
 | 429 | `rate_limit_error` |
 | 5xx | `api_error` |
 
 ## Testing
 
-The test suite validates OpenAI SDK compatibility against the Python gateway running in-process — no GPU or vLLM process required.
+### Unit tests (Python gateway, no GPU required)
 
 ```bash
 # Install dev deps only (skips vllm/torch)
@@ -495,9 +517,29 @@ uv sync --only-group dev --no-install-project
 uv run pytest tests/ -v
 ```
 
-Tests cover: `/health`, `/v1/models`, `/v1/models/local`, chat completions (sync + streaming), authentication errors, invalid JSON, upstream 5xx passthrough, OpenAI error schema validation, and per-key usage endpoint.
+Tests cover: `/health`, `/v1/models`, `/v1/models/local`, chat completions (sync + streaming), authentication errors, invalid JSON, upstream 5xx passthrough, OpenAI error schema validation, and per-key usage endpoint. vLLM is mocked with `respx`; the usage DB is patched with `AsyncMock` stubs so tests are fully self-contained.
 
-vLLM is mocked with `respx`; the gateway's SQLite usage-DB is patched with `AsyncMock` stubs so tests are fully self-contained.
+### Integration tests (live gateway + vLLM)
+
+```bash
+# API surface test — 70 checks covering auth, admin lifecycle, error shapes,
+# security headers, quota, body-size limits, metrics (no inference for most checks)
+.venv/bin/python3 examples/test_api.py
+
+# End-to-end smoke test — system prompts, streaming, reasoning mode, /v1/completions
+.venv/bin/python3 examples/test_gateway.py
+```
+
+`test_api.py` runs in a few seconds; `test_gateway.py` generates actual completions (~2 min).
+
+### Interactive client
+
+```bash
+# Prompt from CLI (key auto-resolved from config/.env)
+.venv/bin/python3 examples/client.py "What is tensor parallelism?"
+.venv/bin/python3 examples/client.py --stream "Explain MoE routing."
+.venv/bin/python3 examples/client.py --url http://localhost:8080 --key gw_... "Hello"
+```
 
 ## Production notes
 
@@ -513,10 +555,12 @@ vLLM is mocked with `respx`; the gateway's SQLite usage-DB is patched with `Asyn
 
 **Cold start and torch.compile:** `launch_vllm.sh` passes `--enforce-eager` which **skips torch.compile entirely**. This avoids an indefinite hang observed on this hardware (workers consumed 46 GB VRAM at 0% utilization for 7+ hours). Triton kernels are still compiled on first run and cached in `.triton_cache/` in the project root; subsequent starts take ~30 seconds. Remove `--enforce-eager` in `VLLM_EXTRA_ARGS` if you want to benchmark torch.compile on a fresh system.
 
-**Slow tokenizer:** `--tokenizer-mode slow` is set in `launch_vllm.sh` to work around a compatibility issue between the fast tokenizer backend (`tokenizers` Rust library) and vLLM 0.16.0. Remove this flag if a future vLLM release resolves it.
+**Slow tokenizer:** `--tokenizer-mode slow` is set in `launch_vllm.sh` because the fast tokenizer Rust library dropped support for `all_special_tokens_extended`, which the Qwen3.5 tokenizer needs.
+
+**BF16 GEMM on torch 2.10.0 + CUDA 12.9:** torch 2.10.0 bundles `nvidia-cublas-cu12==12.8.4.1`, which has a broken BF16 GEMM on Ampere GPUs when the CUDA driver is 12.9. Fix with `uv pip install "nvidia-cublas-cu12==12.9.1.4" --no-deps`. This is a one-time fix that persists because `launch_vllm.sh` activates the venv directly (not via `uv run`).
 
 **CPU swap:** `SWAP_SPACE_GB=8` configures vLLM to spill KV blocks to RAM when GPU cache is full. Use as a safety valve only — PCIe bandwidth makes active swapping very slow.
 
 **First Rust build:** `make gateway` compiles from source on first run (~60s). Use `make build-rust` to pre-compile.
 
-**vLLM + transformers compatibility:** vLLM 0.16.0 requires `transformers<5`. Models using architectures that only landed in transformers 5.x (e.g. `qwen3_5_moe`, `glm4_moe_lite`) need the vLLM nightly wheel. Check the model card for minimum version requirements before downloading.
+**vLLM nightly:** Qwen3.5 (`qwen3_5_moe` architecture) requires vLLM ≥ 0.17.0. The nightly wheel is pinned in `pyproject.toml`. Note that the nightly server only retains the most recent build — if you recreate the venv from scratch, `uv sync` may fail because the exact pinned build has rotated off. In that case, update the version in `pyproject.toml` to whichever build is currently on `wheels.vllm.ai/nightly`.

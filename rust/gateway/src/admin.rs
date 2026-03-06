@@ -126,7 +126,7 @@ async fn patch_key(
 ) -> Result<impl IntoResponse, GatewayError> {
     let found = state.key_store.set_enabled(id, req.enabled).await?;
     if !found {
-        return Err(GatewayError::BadRequest(format!("key {} not found", id)));
+        return Err(GatewayError::NotFound(format!("key {}", id)));
     }
     Ok(Json(PatchKeyResponse { id, enabled: req.enabled }))
 }
@@ -138,7 +138,7 @@ async fn delete_key(
 ) -> Result<StatusCode, GatewayError> {
     let found = state.key_store.delete(id).await?;
     if !found {
-        return Err(GatewayError::BadRequest(format!("key {} not found", id)));
+        return Err(GatewayError::NotFound(format!("key {}", id)));
     }
     Ok(StatusCode::NO_CONTENT)
 }
