@@ -69,7 +69,20 @@ build-rust:
 
 # ── PostgreSQL (API key + quota store) ─────────────────────────────────────
 db:
-	@docker compose -f docker/docker-compose.yml up -d postgres
+	@{ \
+	  PGCTL="$$HOME/.local/share/pgenv/bin/pg_ctl"; \
+	  PGDATA="$$HOME/.local/share/pgdata"; \
+	  if [ -x "$$PGCTL" ]; then \
+	    if "$$PGCTL" status -D "$$PGDATA" >/dev/null 2>&1; then \
+	      echo "  PostgreSQL already running (pgenv)."; \
+	    else \
+	      "$$PGCTL" start -D "$$PGDATA" -l "$$PGDATA/postgres.log"; \
+	      echo "  PostgreSQL started (pgenv)."; \
+	    fi; \
+	  else \
+	    docker compose -f docker/docker-compose.yml up -d postgres; \
+	  fi; \
+	}
 	@echo "PostgreSQL: localhost:5432  (user: gateway)"
 
 # ── Monitoring stack ────────────────────────────────────────────────────────

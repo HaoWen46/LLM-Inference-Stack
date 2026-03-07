@@ -73,9 +73,20 @@ fi
 # ── Full repo snapshot via huggingface_hub ────────────────────────────────────
 cd "$ROOT_DIR"
 
+# Use the venv's Python directly to avoid uv dependency resolution (which
+# would fail if the vllm nightly wheel has rotated since the lockfile was written).
+# download_model.sh only needs huggingface_hub, not vllm.
+if [[ -f "$ROOT_DIR/.venv/bin/python3" ]]; then
+    PYTHON="$ROOT_DIR/.venv/bin/python3"
+else
+    PYTHON="$(command -v uv) run python3"
+fi
+# Force unbuffered output so progress lines appear immediately in logs
+export PYTHONUNBUFFERED=1
+
 if [[ -z "$STAGE_DIR" ]]; then
     # No staging: download directly to final destination in one shot
-    uv run python3 - <<EOF
+    $PYTHON - <<EOF
 import os
 from huggingface_hub import snapshot_download
 
@@ -99,7 +110,7 @@ else
     FINAL_MODEL_DIR="$FINAL_DIR/$MODEL_NAME"
     mkdir -p "$STAGE_MODEL_DIR" "$FINAL_MODEL_DIR"
 
-    uv run python3 - <<EOF
+    $PYTHON - <<EOF
 import os, fnmatch, shutil
 from huggingface_hub import list_repo_files, hf_hub_download
 

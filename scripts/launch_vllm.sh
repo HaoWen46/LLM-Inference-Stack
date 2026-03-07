@@ -89,6 +89,13 @@ if [[ "${LIMIT_MM_PER_PROMPT:-}" != "" ]]; then
     VISION_ARG="--limit-mm-per-prompt ${LIMIT_MM_PER_PROMPT}"
 fi
 
+# LoRA: enable when LORA_MODULES is set (format: "alias=path [alias=path ...]")
+LORA_ARG=""
+if [[ "${LORA_MODULES:-}" != "" ]]; then
+    LORA_ARG="--enable-lora --lora-modules ${LORA_MODULES} --max-lora-rank ${MAX_LORA_RANK:-32}"
+    echo "[vllm] LoRA enabled: ${LORA_MODULES}"
+fi
+
 echo "[vllm] Starting model: ${MODEL_NAME}"
 echo "[vllm] TP size: ${TP_SIZE}"
 echo "[vllm] Quantization: ${QUANTIZATION:-none}"
@@ -119,4 +126,5 @@ exec python3 -m vllm.entrypoints.openai.api_server \
     ${PREFIX_CACHE_ARG} \
     ${CHUNKED_PREFILL_ARG} \
     ${VISION_ARG} \
+    ${LORA_ARG} \
     ${VLLM_EXTRA_ARGS:-}
