@@ -77,7 +77,8 @@ The gateway is a single Rust workspace at `rust/` with two crates: `gateway` and
 | `proxy.rs` | Core dispatcher: `backend_router.select(model)` → sync/SSE proxy; `models_handler` fans out to all healthy backends; model-name rewrite via `backend.served_model_name` |
 | `auth.rs` | `ApiKey` extractor — accepts `Authorization: Bearer <key>` or `X-API-Key: <key>`; SHA-256 hash → DashMap lookup; checks `expires_at` on hot path |
 | `keys.rs` | `KeyStore`: PgPool + DashMap cache; key generation (`gw_` prefix), CRUD, background refresh every 60s; org CRUD and org usage aggregation |
-| `admin.rs` | Admin REST handlers: `/admin/keys` CRUD + `PUT /admin/keys/:id/limits`; `/admin/orgs` CRUD + `GET /admin/orgs/:id/usage` |
+| `admin.rs` | Admin REST handlers: `/admin/keys` CRUD + `PUT /admin/keys/:id/limits`; `/admin/orgs` CRUD + `GET /admin/orgs/:id/usage`; `GET /admin/logs` paginated request log query |
+| `request_log.rs` | `RequestLogger`: non-blocking channel (8192 capacity) → background worker inserts into `request_logs` table; called by proxy after each completed request |
 | `quota.rs` | Per-key daily token quota: `DashMap` in-memory fast path, flushed to PostgreSQL every 10s; `is_allowed()` accepts per-key limit override |
 | `rate_limiter.rs` | Per-IP GCRA via `governor`; separate per-key DashMap for `rpm_limit` enforcement; background eviction of idle entries |
 | `batches.rs` | Batch inference API — `POST/GET /v1/batches`, `GET/POST /:id`, `GET /:id/results`; background tokio worker routes each item via `backend_router`; stored in `batches` table |
@@ -115,6 +116,7 @@ The gateway is a single Rust workspace at `rust/` with two crates: `gateway` and
 | `POST /admin/orgs` | Admin key | Create organisation |
 | `GET /admin/orgs` | Admin key | List organisations |
 | `GET /admin/orgs/:id/usage` | Admin key | Aggregate token usage for all keys in an org |
+| `GET /admin/logs` | Admin key | Paginated request log query (`?key_id=&model=&date=&limit=&offset=`) |
 
 ## Operational Notes
 

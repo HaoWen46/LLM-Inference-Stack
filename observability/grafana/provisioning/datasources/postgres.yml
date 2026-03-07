@@ -1,0 +1,16 @@
+apiVersion: 1
+datasources:
+  - name: PostgreSQL
+    uid: postgres
+    type: postgres
+    access: proxy
+    url: postgres:5432
+    database: gateway
+    user: gateway
+    isDefault: false
+    jsonData:
+      sslmode: disable
+      postgresVersion: 1700
+      timescaledb: false
+    secureJsonData:
+      password: "${POSTGRES_PASSWORD:-changeme}"

@@ -3,7 +3,7 @@
 /// All endpoints require `Authorization: Bearer <ADMIN_KEY>` where ADMIN_KEY
 /// is a separate secret from the gateway API keys.
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Json},
     routing::{get, patch, post, put},
@@ -123,6 +123,39 @@ pub struct OrgUsageResponse {
     pub key_count: i64,
 }
 
+// ── Request / response types — logs ──────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct LogsQuery {
+    pub key_id: Option<Uuid>,
+    pub model: Option<String>,
+    /// Filter by date (YYYY-MM-DD, UTC).
+    pub date: Option<String>,
+    #[serde(default = "default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+}
+
+fn default_limit() -> i64 {
+    100
+}
+
+#[derive(Serialize)]
+pub struct LogEntry {
+    pub id: i64,
+    pub key_id: Option<Uuid>,
+    pub key_hash: String,
+    pub model: String,
+    pub endpoint: String,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub latency_ms: i32,
+    pub status_code: i16,
+    pub truncated_prompt: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
 // ── Router ────────────────────────────────────────────────────────────────────
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -134,6 +167,8 @@ pub fn router() -> Router<Arc<AppState>> {
         // Org CRUD + usage
         .route("/orgs", post(create_org).get(list_orgs))
         .route("/orgs/:id/usage", get(org_usage))
+        // Request logs
+        .route("/logs", get(list_logs))
 }
 
 // ── Key handlers ──────────────────────────────────────────────────────────────
@@ -272,4 +307,93 @@ async fn org_usage(
         request_count: usage.request_count,
         key_count: usage.key_count,
     }))
+}
+
+// ── Log handlers ──────────────────────────────────────────────────────────────
+
+/// GET /admin/logs — paginated request log query.
+///
+/// Query params (all optional):
+///   key_id=<uuid>   — filter by API key UUID
+///   model=<str>     — filter by model name
+///   date=<YYYY-MM-DD> — filter by UTC date
+///   limit=<n>       — max rows (default 100, max 1000)
+///   offset=<n>      — skip N rows for pagination
+async fn list_logs(
+    _auth: AdminAuth,
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<LogsQuery>,
+) -> Result<impl IntoResponse, GatewayError> {
+    let limit = q.limit.clamp(1, 1000);
+
+    // Build a dynamic query using QueryBuilder.
+    let mut qb = sqlx::QueryBuilder::new(
+        "SELECT id, key_id, key_hash, model, endpoint, \
+                prompt_tokens, completion_tokens, latency_ms, status_code, \
+                truncated_prompt, created_at \
+         FROM request_logs WHERE 1=1",
+    );
+
+    if let Some(kid) = q.key_id {
+        qb.push(" AND key_id = ");
+        qb.push_bind(kid);
+    }
+    if let Some(ref model) = q.model {
+        qb.push(" AND model = ");
+        qb.push_bind(model.clone());
+    }
+    if let Some(ref date) = q.date {
+        qb.push(" AND created_at::date = ");
+        qb.push_bind(date.clone());
+    }
+
+    qb.push(" ORDER BY created_at DESC LIMIT ");
+    qb.push_bind(limit);
+    qb.push(" OFFSET ");
+    qb.push_bind(q.offset);
+
+    let rows = qb
+        .build_query_as::<LogRow>()
+        .fetch_all(&state.db_pool)
+        .await
+        .map_err(|e| GatewayError::Internal(anyhow::anyhow!(e)))?;
+
+    let entries: Vec<LogEntry> = rows
+        .into_iter()
+        .map(|r| LogEntry {
+            id: r.id,
+            key_id: r.key_id,
+            key_hash: r.key_hash,
+            model: r.model,
+            endpoint: r.endpoint,
+            prompt_tokens: r.prompt_tokens,
+            completion_tokens: r.completion_tokens,
+            latency_ms: r.latency_ms,
+            status_code: r.status_code,
+            truncated_prompt: r.truncated_prompt,
+            created_at: r.created_at,
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "object": "list",
+        "data": entries,
+        "limit": limit,
+        "offset": q.offset,
+    })))
+}
+
+#[derive(sqlx::FromRow)]
+struct LogRow {
+    id: i64,
+    key_id: Option<Uuid>,
+    key_hash: String,
+    model: String,
+    endpoint: String,
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    latency_ms: i32,
+    status_code: i16,
+    truncated_prompt: Option<String>,
+    created_at: DateTime<Utc>,
 }

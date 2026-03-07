@@ -14,6 +14,7 @@ mod metrics;
 mod proxy;
 mod quota;
 mod rate_limiter;
+mod request_log;
 mod tracing_setup;
 
 use sqlx::PgPool;
@@ -43,6 +44,7 @@ use crate::{
     metrics::AppMetrics,
     quota::QuotaStore,
     rate_limiter::RateLimiterMap,
+    request_log::RequestLogger,
 };
 
 // ── Shared application state ─────────────────────────────────────────────────
@@ -59,6 +61,8 @@ pub struct AppState {
     pub metrics: Arc<AppMetrics>,
     /// PostgreSQL pool — used by batch workers and admin handlers.
     pub db_pool: PgPool,
+    /// Non-blocking request logger — enqueues entries for background DB insert.
+    pub request_logger: Arc<RequestLogger>,
     /// Set to true once the primary backend has responded healthy (warmup complete).
     pub warmed_up: Arc<AtomicBool>,
     /// Set to true on SIGTERM/Ctrl-C; new proxy requests return 503.
@@ -136,6 +140,8 @@ async fn main() -> anyhow::Result<()> {
     let warmed_up = Arc::new(AtomicBool::new(false));
     let shutting_down = Arc::new(AtomicBool::new(false));
 
+    let request_logger = RequestLogger::new(pool.clone());
+
     let state = Arc::new(AppState {
         config: config.clone(),
         client: client.clone(),
@@ -145,6 +151,7 @@ async fn main() -> anyhow::Result<()> {
         key_store,
         metrics: app_metrics.clone(),
         db_pool: pool.clone(),
+        request_logger,
         warmed_up: warmed_up.clone(),
         shutting_down: shutting_down.clone(),
     });

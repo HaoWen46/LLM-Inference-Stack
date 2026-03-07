@@ -10,6 +10,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use serde_json::Value;
 use std::{collections::HashSet, net::SocketAddr, path::Path, sync::Arc, time::Instant};
+use uuid::Uuid;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, warn};
 
@@ -19,6 +20,7 @@ use crate::{
     error::GatewayError,
     keys::sha256_hex,
     metrics::{EndpointModelLabels, ModelLabel, RequestLabels, StatusCodeLabel},
+    request_log::LogEntry,
     AppState,
 };
 
@@ -316,10 +318,12 @@ async fn proxy_request(
     state.metrics.active_requests.inc();
     state.metrics.inflight_requests.inc();
 
+    let key_id = key_meta.as_ref().map(|m| m.id);
+
     let result = if stream {
-        stream_proxy(state.clone(), api_key, body, &model, path, backend).await
+        stream_proxy(state.clone(), api_key, key_hash, key_id, body, &model, path, backend).await
     } else {
-        sync_proxy(state.clone(), api_key, body, &model, path, backend).await
+        sync_proxy(state.clone(), api_key, key_hash, key_id, body, &model, path, backend).await
     };
 
     state.metrics.active_requests.dec();
@@ -333,6 +337,8 @@ async fn proxy_request(
 async fn sync_proxy(
     state: Arc<AppState>,
     api_key: String,
+    key_hash: String,
+    key_id: Option<Uuid>,
     body: Value,
     model: &str,
     path: &str,
@@ -446,6 +452,28 @@ async fn sync_proxy(
         state.quota.add_tokens(&api_key, prompt_tokens, completion_tokens);
     }
 
+    // Extract a truncated prompt for the request log (first 512 chars of last user message or prompt).
+    let truncated_prompt = body
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.last())
+        .and_then(|m| m.get("content"))
+        .or_else(|| body.get("prompt"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.chars().take(512).collect::<String>());
+
+    state.request_logger.log(LogEntry {
+        key_id,
+        key_hash,
+        model: model.to_string(),
+        endpoint: path.to_string(),
+        prompt_tokens,
+        completion_tokens,
+        latency_ms: (duration * 1000.0) as u32,
+        status_code: status.as_u16(),
+        truncated_prompt,
+    });
+
     let axum_status =
         StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
@@ -461,6 +489,8 @@ async fn sync_proxy(
 async fn stream_proxy(
     state: Arc<AppState>,
     api_key: String,
+    key_hash: String,
+    key_id: Option<Uuid>,
     mut body: Value,
     model: &str,
     path: &str,
@@ -479,6 +509,16 @@ async fn stream_proxy(
 
     // Channel: background task → axum response body
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+
+    // Snapshot truncated prompt before moving `body` into the spawn.
+    let truncated_prompt = body
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.last())
+        .and_then(|m| m.get("content"))
+        .or_else(|| body.get("prompt"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.chars().take(512).collect::<String>());
 
     tokio::spawn({
         let state = state.clone();
@@ -638,7 +678,7 @@ async fn stream_proxy(
                 .metrics
                 .request_latency
                 .get_or_create(&EndpointModelLabels {
-                    endpoint: path_str,
+                    endpoint: path_str.clone(),
                     model: model.clone(),
                 })
                 .observe(duration);
@@ -662,6 +702,18 @@ async fn stream_proxy(
                     .quota
                     .add_tokens(&api_key, exact_prompt_tokens, exact_completion_tokens);
             }
+
+            state.request_logger.log(crate::request_log::LogEntry {
+                key_id,
+                key_hash,
+                model: model.clone(),
+                endpoint: path_str,
+                prompt_tokens: exact_prompt_tokens,
+                completion_tokens: exact_completion_tokens,
+                latency_ms: (duration * 1000.0) as u32,
+                status_code: status.as_u16(),
+                truncated_prompt,
+            });
         }
     });
 
@@ -803,7 +855,7 @@ async fn proxy_post_simple(
         .request_latency
         .get_or_create(&EndpointModelLabels {
             endpoint: path.to_string(),
-            model,
+            model: model.clone(),
         })
         .observe(duration);
 
@@ -813,6 +865,18 @@ async fn proxy_post_simple(
         prompt_tokens,
         "request complete"
     );
+
+    state.request_logger.log(LogEntry {
+        key_id: key_meta.as_ref().map(|m| m.id),
+        key_hash,
+        model,
+        endpoint: path.to_string(),
+        prompt_tokens,
+        completion_tokens: 0,
+        latency_ms: (duration * 1000.0) as u32,
+        status_code: status.as_u16(),
+        truncated_prompt: None,
+    });
 
     let axum_status =
         StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);

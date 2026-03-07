@@ -1,0 +1,214 @@
+{
+  "title": "LLM Gateway — Request Logs",
+  "uid": "llm-request-logs",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": {},
+  "tags": ["llm", "gateway", "logs"],
+  "panels": [
+    {
+      "id": 1,
+      "title": "Request Rate (rpm)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "datasource": { "type": "postgres", "uid": "postgres" },
+      "options": {
+        "tooltip": { "mode": "single" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      },
+      "fieldConfig": {
+        "defaults": { "unit": "reqpm", "custom": { "lineWidth": 2 } }
+      },
+      "targets": [
+        {
+          "rawQuery": true,
+          "rawSql": "SELECT\n  date_trunc('minute', created_at) AS time,\n  COUNT(*) AS requests\nFROM request_logs\nWHERE $__timeFilter(created_at)\nGROUP BY 1\nORDER BY 1",
+          "format": "time_series",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Token Throughput (tokens/min)",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "datasource": { "type": "postgres", "uid": "postgres" },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "lineWidth": 2 } }
+      },
+      "targets": [
+        {
+          "rawQuery": true,
+          "rawSql": "SELECT\n  date_trunc('minute', created_at) AS time,\n  SUM(prompt_tokens) AS prompt,\n  SUM(completion_tokens) AS completion\nFROM request_logs\nWHERE $__timeFilter(created_at)\nGROUP BY 1\nORDER BY 1",
+          "format": "time_series",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "P95 Latency by Model (ms)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "datasource": { "type": "postgres", "uid": "postgres" },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      },
+      "fieldConfig": {
+        "defaults": { "unit": "ms", "custom": { "lineWidth": 2 } }
+      },
+      "targets": [
+        {
+          "rawQuery": true,
+          "rawSql": "SELECT\n  date_trunc('minute', created_at) AS time,\n  model,\n  PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY latency_ms) AS p95_ms\nFROM request_logs\nWHERE $__timeFilter(created_at)\nGROUP BY 1, 2\nORDER BY 1",
+          "format": "time_series",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Error Rate (non-2xx)",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "datasource": { "type": "postgres", "uid": "postgres" },
+      "options": {
+        "tooltip": { "mode": "single" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": { "lineWidth": 2 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.05 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "rawQuery": true,
+          "rawSql": "SELECT\n  date_trunc('minute', created_at) AS time,\n  COUNT(*) FILTER (WHERE status_code >= 400)::float / NULLIF(COUNT(*), 0) AS error_rate\nFROM request_logs\nWHERE $__timeFilter(created_at)\nGROUP BY 1\nORDER BY 1",
+          "format": "time_series",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Tokens Today by Model",
+      "type": "barchart",
+      "gridPos": { "x": 0, "y": 16, "w": 12, "h": 8 },
+      "datasource": { "type": "postgres", "uid": "postgres" },
+      "options": {
+        "orientation": "horizontal",
+        "xTickLabelRotation": 0,
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      },
+      "fieldConfig": {
+        "defaults": { "unit": "short" }
+      },
+      "targets": [
+        {
+          "rawQuery": true,
+          "rawSql": "SELECT\n  model,\n  SUM(prompt_tokens + completion_tokens) AS total_tokens\nFROM request_logs\nWHERE created_at::date = CURRENT_DATE\nGROUP BY model\nORDER BY total_tokens DESC\nLIMIT 10",
+          "format": "table",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Top API Keys Today (by requests)",
+      "type": "table",
+      "gridPos": { "x": 12, "y": 16, "w": 12, "h": 8 },
+      "datasource": { "type": "postgres", "uid": "postgres" },
+      "options": {
+        "sortBy": [{ "displayName": "requests", "desc": true }]
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "key_hash" },
+            "properties": [{ "id": "custom.width", "value": 240 }]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "rawQuery": true,
+          "rawSql": "SELECT\n  COALESCE(k.label, r.key_hash) AS key_label,\n  COUNT(*) AS requests,\n  SUM(r.prompt_tokens) AS prompt_tokens,\n  SUM(r.completion_tokens) AS completion_tokens\nFROM request_logs r\nLEFT JOIN api_keys k ON k.id = r.key_id\nWHERE r.created_at::date = CURRENT_DATE\nGROUP BY 1\nORDER BY requests DESC\nLIMIT 20",
+          "format": "table",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Recent Requests",
+      "type": "table",
+      "gridPos": { "x": 0, "y": 24, "w": 24, "h": 10 },
+      "datasource": { "type": "postgres", "uid": "postgres" },
+      "options": {
+        "sortBy": [{ "displayName": "created_at", "desc": true }],
+        "footer": { "show": false }
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "truncated_prompt" },
+            "properties": [{ "id": "custom.width", "value": 400 }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "latency_ms" },
+            "properties": [
+              { "id": "unit", "value": "ms" },
+              { "id": "custom.width", "value": 100 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "status_code" },
+            "properties": [
+              {
+                "id": "custom.displayMode",
+                "value": "color-background"
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "green", "value": null },
+                    { "color": "red", "value": 400 }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "rawQuery": true,
+          "rawSql": "SELECT\n  created_at,\n  COALESCE(k.label, r.key_hash) AS key_label,\n  r.model,\n  r.endpoint,\n  r.status_code,\n  r.latency_ms,\n  r.prompt_tokens,\n  r.completion_tokens,\n  r.truncated_prompt\nFROM request_logs r\nLEFT JOIN api_keys k ON k.id = r.key_id\nWHERE $__timeFilter(r.created_at)\nORDER BY r.created_at DESC\nLIMIT 100",
+          "format": "table",
+          "refId": "A"
+        }
+      ]
+    }
+  ]
+}
