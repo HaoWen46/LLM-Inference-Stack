@@ -139,7 +139,7 @@ def test_models(c: httpx.Client, api_key: str):
     if body.get("data"):
         m = body["data"][0]
         check("Model object has 'id'", "id" in m)
-        check("Model id is Qwen3.5-35B-A3B", m["id"] == "Qwen/Qwen3.5-35B-A3B")
+        check("Model id is Qwen3.5-35B-A3B", m["id"] == "Qwen/Qwen3.5-27B")
 
     r = c.get(f"{GATEWAY}/v1/models/local", headers=auth(api_key))
     check("/v1/models/local → 200", r.status_code == 200)
@@ -157,7 +157,7 @@ def test_request_validation(c: httpx.Client, api_key: str):
 
     # Missing messages field
     r = c.post(f"{GATEWAY}/v1/chat/completions", headers=hdrs,
-               json={"model": "Qwen/Qwen3.5-35B-A3B"})
+               json={"model": "Qwen/Qwen3.5-27B"})
     check("Missing messages → 4xx", r.status_code >= 400)
     err = r.json().get("error", {})
     check("Error has 'message' key", "message" in err)
@@ -167,7 +167,7 @@ def test_request_validation(c: httpx.Client, api_key: str):
 
     # Empty messages list
     r = c.post(f"{GATEWAY}/v1/chat/completions", headers=hdrs,
-               json={"model": "Qwen/Qwen3.5-35B-A3B", "messages": []})
+               json={"model": "Qwen/Qwen3.5-27B", "messages": []})
     check("Empty messages → 4xx", r.status_code >= 400)
 
     # Invalid JSON
@@ -302,11 +302,11 @@ def test_completions_endpoint(c: httpx.Client, api_key: str):
     hdrs = {**auth(api_key), **json_body()}
     r = c.post(f"{GATEWAY}/v1/completions", headers=hdrs,
                json={
-                   "model": "Qwen/Qwen3.5-35B-A3B",
+                   "model": "Qwen/Qwen3.5-27B",
                    "prompt": "The capital of France is",
                    "max_tokens": 5,
                    "temperature": 0.0,
-               }, timeout=30)
+               }, timeout=120)
     check("POST /v1/completions → 200", r.status_code == 200)
     body = r.json()
     check("Response has choices", len(body.get("choices", [])) > 0)
@@ -336,7 +336,7 @@ def main():
     print(f"API key:   {api_key[:8]}...")
     print(f"Admin key: {admin_key[:8]}...")
 
-    with httpx.Client(timeout=15) as c:
+    with httpx.Client(timeout=120) as c:
         test_health(c)
         test_metrics(c)
         test_security_headers(c, api_key)

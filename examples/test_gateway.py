@@ -35,14 +35,15 @@ def headers(key: str) -> dict:
 
 
 def chat(client: httpx.Client, key: str, system: str, user: str,
-         max_tokens: int = 512, think: bool = False) -> tuple[str, dict]:
+         max_tokens: int = 512, think: bool = False,
+         model: str = "Qwen/Qwen3.5-27B") -> tuple[str, dict]:
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
 
     payload: dict = {
-        "model": "Qwen/Qwen3.5-35B-A3B",
+        "model": model,
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": 0.6,
@@ -83,7 +84,7 @@ def chat_stream(client: httpx.Client, key: str, system: str, user: str,
         f"{GATEWAY}/v1/chat/completions",
         headers=headers(key),
         json={
-            "model": "Qwen/Qwen3.5-35B-A3B",
+            "model": "Qwen/Qwen3.5-27B",
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": 0.6,
@@ -181,8 +182,22 @@ def run(key: str):
         print(content)
         print(f"\n  [{usage['prompt_tokens']}p + {usage['completion_tokens']}c | {usage['elapsed_s']}s]")
 
+        # ── LoRA adapter ──────────────────────────────────────────
+        section("6. LoRA adapter — qwen3-27b-opus")
+        print("  Sending request with model='qwen3-27b-opus' to activate the LoRA adapter.\n")
+        content, usage = chat(
+            client, key,
+            system="You are a helpful assistant.",
+            user="In one sentence, what is a LoRA adapter in the context of LLMs?",
+            max_tokens=128,
+            think=False,
+            model="qwen3-27b-opus",
+        )
+        print(content)
+        print(f"\n  [{usage['prompt_tokens']}p + {usage['completion_tokens']}c | {usage['elapsed_s']}s | {usage['tok_per_s']} tok/s]")
+
         # ── Usage endpoint ────────────────────────────────────────
-        section("6. Per-key usage quota")
+        section("7. Per-key usage quota")
         r = client.get(f"{GATEWAY}/v1/usage", headers=headers(key), timeout=10)
         print(json.dumps(r.json(), indent=2))
 
