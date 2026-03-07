@@ -54,7 +54,8 @@ Sidecar: gpu-exporter :9101 → Prometheus :9090 → Grafana :3000
 All runtime config lives in `config/.env` (gitignored; template at `config/.env.example`). Key variables:
 
 - `MODEL_NAME`, `HF_TOKEN`, `MODEL_CACHE_DIR` — model identity and weights path
-- `VLLM_API_KEY` — internal secret between gateway and vLLM (not client-facing)
+- `VLLM_API_KEY` — internal secret between gateway and vLLM; required if `BACKENDS` is not set
+- `BACKENDS` — multi-backend config (optional); format: `url|api_key|models|weight|served_name` semicolon-separated; if not set, falls back to `VLLM_URL` + `VLLM_API_KEY` + `SERVED_MODEL_NAME` as a single backend
 - `DATABASE_URL` — PostgreSQL connection string (required by gateway)
 - `ADMIN_KEY` — Bearer token for `/admin/*` key management endpoints
 - `GATEWAY_API_KEYS` — optional seed: if set and the DB has no keys, each entry is auto-inserted once at startup; use the admin API for ongoing key management
@@ -71,15 +72,16 @@ The gateway is a single Rust workspace at `rust/` with two crates: `gateway` and
 
 | File | Role |
 |------|------|
-| `main.rs` | Axum router, warmup task, graceful shutdown (30s drain on SIGTERM) |
-| `proxy.rs` | Core dispatcher: sync proxy + SSE streaming via `reqwest::bytes_stream()` → `tokio::mpsc` → `Body::from_stream`; TTFT measured on first `data:` line; enforces model allowlist and per-key quota |
+| `main.rs` | Axum router, warmup task (polls primary backend `/health`), graceful shutdown (30s drain on SIGTERM) |
+| `backends.rs` | `BackendDef`/`Backend`/`BackendRouter`: per-backend CB + `AtomicBool` health; weighted random selection; `start_health_task()` polls every 10s |
+| `proxy.rs` | Core dispatcher: `backend_router.select(model)` → sync/SSE proxy; `models_handler` fans out to all healthy backends; model-name rewrite via `backend.served_model_name` |
 | `auth.rs` | `ApiKey` extractor — accepts `Authorization: Bearer <key>` or `X-API-Key: <key>`; SHA-256 hash → DashMap lookup; checks `expires_at` on hot path |
 | `keys.rs` | `KeyStore`: PgPool + DashMap cache; key generation (`gw_` prefix), CRUD, background refresh every 60s; org CRUD and org usage aggregation |
 | `admin.rs` | Admin REST handlers: `/admin/keys` CRUD + `PUT /admin/keys/:id/limits`; `/admin/orgs` CRUD + `GET /admin/orgs/:id/usage` |
 | `quota.rs` | Per-key daily token quota: `DashMap` in-memory fast path, flushed to PostgreSQL every 10s; `is_allowed()` accepts per-key limit override |
 | `rate_limiter.rs` | Per-IP GCRA via `governor`; separate per-key DashMap for `rpm_limit` enforcement; background eviction of idle entries |
-| `batches.rs` | Batch inference API — `POST/GET /v1/batches`, `GET/POST /:id`, `GET /:id/results`; background tokio worker; stored in `batches` PostgreSQL table |
-| `circuit_breaker.rs` | Lockless: `AtomicU8` state (CLOSED/OPEN/HALF_OPEN) + `AtomicU64` failure counter, `compare_exchange` transitions |
+| `batches.rs` | Batch inference API — `POST/GET /v1/batches`, `GET/POST /:id`, `GET /:id/results`; background tokio worker routes each item via `backend_router`; stored in `batches` table |
+| `circuit_breaker.rs` | Lockless: `AtomicU8` state (CLOSED/OPEN/HALF_OPEN) + `AtomicU64` failure counter, `compare_exchange` transitions; one instance per backend |
 | `metrics.rs` | `prometheus-client` registry: request counters, latency histograms, TTFT, active gauge |
 | `tracing_setup.rs` | JSON structured logging + optional OpenTelemetry OTLP to Jaeger |
 
