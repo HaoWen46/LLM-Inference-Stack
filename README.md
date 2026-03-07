@@ -4,7 +4,7 @@ Production-grade LLM serving on 3× NVIDIA RTX A6000 (144 GB total VRAM).
 
 Built on [vLLM](https://github.com/vllm-project/vllm) with a **Rust/Axum gateway**, Prometheus metrics, and Grafana dashboards.
 
-**Current deployment:** `Qwen/Qwen3.5-35B-A3B` (BF16, reasoning model) on GPUs 0 & 1 (A6000, TP=2).
+**Current deployment:** `Qwen/Qwen3.5-27B` (BF16, reasoning model) on GPUs 0 & 1 (A6000, TP=2).
 
 ## Architecture
 
@@ -18,7 +18,7 @@ NGINX  (TLS termination, optional)
 Gateway :8080  (Rust/Axum — auth, rate-limit, quota, circuit breaker, metrics)
   │
   ▼
-vLLM   :8000  (inference, KV cache, tensor parallelism)
+vLLM   :8000  (inference, KV cache, tensor parallelism — Qwen3.5-27B, TP=2)
   │
   ├── GPU 0  RTX A6000 48GB
   └── GPU 1  RTX A6000 48GB
@@ -34,8 +34,8 @@ Sidecar processes
 |-----------|----------|---------|
 | vLLM 0.17.0 nightly | Python | Inference engine — paged attention, continuous batching, tensor parallelism |
 | **Axum 0.7** | **Rust** | **API gateway — zero-GC, predictable tail latency** |
-| **governor** | **Rust** | **Per-IP GCRA rate limiting** |
-| **sqlx + DashMap** | **Rust** | **Per-key daily token quota (PostgreSQL backend)** |
+| **governor** | **Rust** | **Per-IP and per-key GCRA rate limiting** |
+| **sqlx + DashMap** | **Rust** | **Key store, per-key quota and limits (PostgreSQL backend)** |
 | **prometheus-client** | **Rust** | **Metrics exposition** |
 | Prometheus 2.55 | — | Metrics storage |
 | Grafana 11.3 | — | Dashboards and alerting |
@@ -48,8 +48,8 @@ The Python FastAPI gateway (`gateway/`) is kept as a reference implementation an
 
 | # | GPU | VRAM | Notes |
 |---|-----|------|-------|
-| 0 | NVIDIA RTX A6000 | 48 GB | **active — Qwen3.5-35B shard 0** |
-| 1 | NVIDIA RTX A6000 | 48 GB | **active — Qwen3.5-35B shard 1** |
+| 0 | NVIDIA RTX A6000 | 48 GB | **active — Qwen3.5-27B shard 0** |
+| 1 | NVIDIA RTX A6000 | 48 GB | **active — Qwen3.5-27B shard 1** |
 | 2 | NVIDIA RTX A6000 | 48 GB | available |
 
 - **RAM:** 128 GB system
@@ -99,8 +99,8 @@ Key values:
 ```bash
 # Use the full local path for MODEL_NAME — avoids HuggingFace re-downloading
 # weights that are already on disk when you restart vLLM.
-MODEL_NAME=/home5/B11902156/models/Qwen/Qwen3.5-35B-A3B
-SERVED_MODEL_NAME=Qwen/Qwen3.5-35B-A3B
+MODEL_NAME=/home5/B11902156/models/Qwen/Qwen3.5-27B   # full local path avoids re-download
+SERVED_MODEL_NAME=Qwen/Qwen3.5-27B
 MODEL_CACHE_DIR=/home5/B11902156/models   # scanned by GET /v1/models/local
 
 VLLM_PORT=8000
@@ -145,7 +145,7 @@ MAX_MODEL_LEN=8192
 ```bash
 make download
 # or explicitly (full HF repo):
-bash scripts/download_model.sh Qwen/Qwen3.5-35B-A3B
+bash scripts/download_model.sh Qwen/Qwen3.5-27B
 
 # single GGUF file (bypasses huggingface_hub / hf_xet):
 bash scripts/download_model.sh TheBloke/Mistral-7B-v0.1-GGUF mistral-7b-v0.1.Q8_0.gguf
@@ -158,11 +158,6 @@ Models are saved to `MODEL_CACHE_DIR/<repo-id>/` (configurable via `.env`).
 > architectures (Qwen3, Llama, Mistral, DeepSeek-R1-Distill) work with the stable
 > 0.16 release.
 >
-> **Vision-language models (VL) run text-only:** Qwen3.5-35B-A3B is a VL model.
-> Set `LIMIT_MM_PER_PROMPT='{"image":0,"video":0}'` in `.env` so the vision
-> encoder is never invoked during the profile run — otherwise TP > 1 causes a
-> CUBLAS error on 0-row BF16 GEMMs.
-
 ### 4. Run the stack
 
 Open two terminal panes (or use tmux):
@@ -215,12 +210,24 @@ curl -X POST http://localhost:8080/admin/keys \
   -d '{"label": "dev"}' | jq .
 # copy the "key" field → API_KEY=gw_...
 
+# Create a key with per-key limits (all optional)
+curl -X POST http://localhost:8080/admin/keys \
+  -H "Authorization: Bearer $ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "label": "alice",
+    "rpm_limit": 30,
+    "daily_token_limit": 500000,
+    "allowed_models": ["Qwen/Qwen3.5-27B"],
+    "expires_at": "2026-12-31T23:59:59Z"
+  }' | jq .
+
 # Non-streaming chat
 curl http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "Qwen/Qwen3.5-35B-A3B",
+    "model": "Qwen/Qwen3.5-27B",
     "messages": [{"role": "user", "content": "What is tensor parallelism?"}],
     "max_tokens": 256
   }'
@@ -230,7 +237,7 @@ curl http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "Qwen/Qwen3.5-35B-A3B",
+    "model": "Qwen/Qwen3.5-27B",
     "messages": [{"role": "user", "content": "Explain MoE briefly."}],
     "max_tokens": 256,
     "stream": true
@@ -265,19 +272,22 @@ Outputs live stats (req/s, P50/P95/P99 latency, TTFT) and a final report.
 │   ├── gateway/
 │   │   ├── Cargo.toml
 │   │   ├── migrations/
-│   │   │   ├── 001_api_keys.sql
-│   │   │   └── 002_token_usage.sql
+│   │   │   ├── 001_api_keys.sql          ← api_keys table
+│   │   │   ├── 002_token_usage.sql       ← token_usage table
+│   │   │   ├── 003_batches.sql           ← batches table
+│   │   │   └── 004_per_key_controls.sql  ← orgs table; rpm_limit, daily_token_limit, allowed_models, org_id
 │   │   └── src/
 │   │       ├── main.rs       ← router, warmup, graceful shutdown
 │   │       ├── config.rs     ← Config::from_env()
-│   │       ├── auth.rs       ← ApiKey extractor; SHA-256 hash → DashMap lookup
-│   │       ├── keys.rs       ← KeyStore: PgPool + DashMap cache, key generation
-│   │       ├── admin.rs      ← /admin/keys CRUD (ADMIN_KEY auth)
-│   │       ├── rate_limiter.rs ← DashMap<IpAddr, governor::RateLimiter>
+│   │       ├── auth.rs       ← ApiKey extractor; SHA-256 hash → DashMap lookup; expires_at check
+│   │       ├── keys.rs       ← KeyStore: PgPool + DashMap cache, key generation, org CRUD
+│   │       ├── admin.rs      ← /admin/keys CRUD + PUT limits; /admin/orgs CRUD + usage
+│   │       ├── batches.rs    ← batch inference API; background tokio worker
+│   │       ├── rate_limiter.rs ← per-IP and per-key GCRA (governor), idle eviction
 │   │       ├── circuit_breaker.rs ← lockless atomics (no Mutex)
-│   │       ├── quota.rs      ← DashMap cache + PostgreSQL flush every 10s
+│   │       ├── quota.rs      ← DashMap cache + PostgreSQL flush every 10s; per-key limit override
 │   │       ├── metrics.rs    ← prometheus-client Registry
-│   │       ├── proxy.rs      ← sync + SSE streaming proxy, TTFT
+│   │       ├── proxy.rs      ← sync + SSE streaming proxy, TTFT; model allowlist enforcement
 │   │       ├── error.rs      ← GatewayError → HTTP status mapping
 │   │       └── tracing_setup.rs ← tracing-subscriber JSON + OTel OTLP
 │   └── gpu-exporter/
@@ -355,15 +365,20 @@ make logs           tail Loki + Promtail container logs
 
 | Feature | Implementation |
 |---------|---------------|
-| Authentication | `Authorization: Bearer` or `X-API-Key`; SHA-256 hash → DashMap lookup (O(1), no DB I/O on hot path) |
-| Key management | PostgreSQL `api_keys` table; CRUD via `/admin/keys`; cache refreshed every 60s; plaintext never stored |
-| Rate limiting | Per-IP GCRA via `governor`; lazy `DashMap<IpAddr, Arc<RateLimiter>>`; background task evicts entries idle >1 hour |
+| Authentication | `Authorization: Bearer` or `X-API-Key`; SHA-256 hash → DashMap lookup (O(1), no DB I/O on hot path); `expires_at` checked inline |
+| Key management | PostgreSQL `api_keys` table; CRUD + per-key limits via `/admin/keys`; cache refreshed every 60s; plaintext never stored |
+| Organisations | `orgs` table; `org_id` FK on `api_keys`; `GET /admin/orgs/:id/usage` aggregates token usage across all org keys |
+| Rate limiting | **Per-IP**: GCRA via `governor`, lazy `DashMap<IpAddr, Arc<RateLimiter>>`; **per-key**: separate `DashMap<key_hash, (limiter, rpm)>`, recreated if `rpm_limit` changes; both cleaned up after 1h idle |
+| Model allowlist | `allowed_models TEXT[]` on each key; checked in `proxy_request` before forwarding; empty = all models allowed; returns 403 |
+| Per-key quota | `daily_token_limit` on each key overrides global `DAILY_TOKEN_QUOTA`; `0`/NULL = unlimited; `/v1/usage` shows the effective limit |
 | Circuit breaker | Lockless `AtomicU8` state + `AtomicU64` failure counter; `compare_exchange` transitions |
 | Quota | `DashMap` in-memory cache (atomic fast path) flushed to PostgreSQL every 10s; SHA-256 key hashing |
+| Batch API | `POST /v1/batches` accepts inline `requests` array; background `tokio::spawn` worker processes items sequentially; cancellable; results persisted in `batches` table |
 | Request size limit | `DefaultBodyLimit::max(4 MB)` — oversized bodies rejected with 413 before parsing or auth |
 | Streaming | `reqwest::bytes_stream()` → line buffer → `tokio::mpsc` → `Body::from_stream`; injects `stream_options: {include_usage: true}` for exact token counts |
 | TTFT | Measured on first non-empty `data: ` SSE line; recorded as Prometheus histogram |
 | Token counting | Streaming: exact `prompt_tokens`/`completion_tokens` from vLLM's final usage chunk; sync: from `usage` field in response JSON |
+| LoRA routing | `LORA_MODULES="alias=path"` parsed at startup; model name rewrite skipped for known aliases so vLLM activates the correct adapter |
 | Security headers | `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `X-XSS-Protection` on every response via `SetResponseHeaderLayer` |
 | Error sanitization | `UpstreamError` messages (IPs, socket details) logged internally; clients receive only `"Upstream service unavailable"` |
 | Graceful shutdown | `SIGTERM`/`Ctrl-C` → `shutting_down` flag → 30s drain |
@@ -375,7 +390,7 @@ Reference for RTX A6000 (48 GB VRAM each):
 
 | Model | Precision | Weights/GPU (TP=2) | KV headroom | Notes |
 |-------|-----------|-------------------|-------------|-------|
-| Qwen3.5-35B-A3B | bf16 | ~33 GB | ~13 GB | **current; 2× A6000** |
+| Qwen3.5-27B | bf16 | ~27 GB | ~19 GB | **current; 2× A6000** |
 | 7B | bf16 | ~7 GB | ~39 GB | single GPU |
 | 13B | bf16 | ~13 GB | ~35 GB | single GPU |
 | 70B | bf16 | ~35 GB | ~13 GB | TP=2 |
@@ -415,9 +430,9 @@ client = OpenAI(
     api_key="gw_...",   # key from POST /admin/keys
 )
 
-# Streaming (Qwen3.5 is a reasoning model — thinking tokens arrive first)
+# Streaming (Qwen3.5-27B is a reasoning model — thinking tokens arrive first)
 stream = client.chat.completions.create(
-    model="Qwen/Qwen3.5-35B-A3B",
+    model="Qwen/Qwen3.5-27B",
     messages=[{"role": "user", "content": "Explain paged attention."}],
     max_tokens=512,
     stream=True,
@@ -447,11 +462,23 @@ or in raw JSON: `"chat_template_kwargs": {"enable_thinking": false}` at the top 
 | GET | `/v1/models/local` | ✓ | List model weight files on disk (see below) |
 | POST | `/v1/chat/completions` | ✓ | Chat completions (streaming or buffered) |
 | POST | `/v1/completions` | ✓ | Legacy completions |
-| GET | `/v1/usage` | ✓ | Per-key daily token usage |
-| POST | `/admin/keys` | Admin key | Create a key (plaintext shown once) |
-| GET | `/admin/keys` | Admin key | List all keys with metadata |
+| POST | `/v1/embeddings` | ✓ | Embeddings (proxied as-is; requires a dedicated embedding model) |
+| POST | `/v1/tokenize` | ✓ | Tokenize — passthrough to vLLM `/tokenize` |
+| POST | `/v1/detokenize` | ✓ | Detokenize — passthrough to vLLM `/detokenize` |
+| GET | `/v1/usage` | ✓ | Per-key daily token usage (shows effective quota: per-key or global) |
+| POST | `/v1/batches` | ✓ | Create offline batch job (inline requests array) |
+| GET | `/v1/batches` | ✓ | List batch jobs for this key |
+| GET | `/v1/batches/:id` | ✓ | Get batch status |
+| POST | `/v1/batches/:id/cancel` | ✓ | Cancel a running batch |
+| GET | `/v1/batches/:id/results` | ✓ | Fetch completed batch results |
+| POST | `/admin/keys` | Admin key | Create a key (plaintext shown once); accepts optional limits |
+| GET | `/admin/keys` | Admin key | List all keys with metadata and per-key limits |
 | PATCH | `/admin/keys/:id` | Admin key | Enable or disable a key |
+| PUT | `/admin/keys/:id/limits` | Admin key | Replace per-key limits (rpm, daily tokens, model allowlist, expiry, org) |
 | DELETE | `/admin/keys/:id` | Admin key | Delete a key permanently |
+| POST | `/admin/orgs` | Admin key | Create an organisation |
+| GET | `/admin/orgs` | Admin key | List all organisations |
+| GET | `/admin/orgs/:id/usage` | Admin key | Aggregate token usage for all keys in an org (today) |
 
 ### `/v1/models/local` — discover models on disk
 
@@ -467,7 +494,7 @@ curl http://localhost:8080/v1/models/local \
   "object": "list",
   "data": [
     {
-      "id": "Qwen/Qwen3.5-35B-A3B",
+      "id": "Qwen/Qwen3.5-27B",
       "object": "model",
       "owned_by": "local",
       "format": "hf"
@@ -500,9 +527,10 @@ All errors use the OpenAI error schema so standard SDK exception handling works 
 |-------------|--------|
 | 401 | `authentication_error` |
 | 400 / 422 | `invalid_request_error` |
+| 403 | `invalid_request_error` (model not in allowlist) |
 | 404 | `invalid_request_error` |
 | 413 | `invalid_request_error` |
-| 429 | `rate_limit_error` |
+| 429 | `rate_limit_error` (rate limit or quota exceeded) |
 | 5xx | `api_error` |
 
 ## Testing
