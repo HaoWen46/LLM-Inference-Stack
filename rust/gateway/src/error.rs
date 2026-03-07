@@ -34,6 +34,9 @@ pub enum GatewayError {
     #[error("Not found: {0}")]
     NotFound(String),
 
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
+
     #[error("Service is shutting down")]
     ShuttingDown,
 
@@ -63,6 +66,7 @@ impl IntoResponse for GatewayError {
             GatewayError::UpstreamError(_) => StatusCode::SERVICE_UNAVAILABLE,
             GatewayError::BadRequest(_) => StatusCode::BAD_REQUEST,
             GatewayError::NotFound(_) => StatusCode::NOT_FOUND,
+            GatewayError::Forbidden(_) => StatusCode::FORBIDDEN,
             GatewayError::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
             GatewayError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -87,6 +91,10 @@ impl IntoResponse for GatewayError {
             ),
             GatewayError::NotFound(msg) => (
                 format!("Not found: {}", msg),
+                "invalid_request_error",
+            ),
+            GatewayError::Forbidden(msg) => (
+                format!("Forbidden: {}", msg),
                 "invalid_request_error",
             ),
             GatewayError::UpstreamError(_) => (

@@ -16,6 +16,7 @@ use tracing::{error, info, warn};
 use crate::{
     auth::ApiKey,
     error::GatewayError,
+    keys::sha256_hex,
     metrics::{EndpointModelLabels, ModelLabel, RequestLabels, StatusCodeLabel},
     AppState,
 };
@@ -128,12 +129,18 @@ pub async fn usage_handler(
         .await
         .map_err(GatewayError::Internal)?;
 
-    let quota = state.config.daily_token_quota;
+    // Effective quota: per-key override if set, else global
+    let key_hash = sha256_hex(&api_key);
+    let effective_quota = state
+        .key_store
+        .lookup(&key_hash)
+        .and_then(|m| m.daily_token_limit.map(|l| l as u64))
+        .unwrap_or(state.config.daily_token_quota);
     let used = (info.prompt_tokens + info.completion_tokens) as u64;
-    let remaining: i64 = if quota == 0 {
+    let remaining: i64 = if effective_quota == 0 {
         -1
     } else {
-        (quota as i64 - used as i64).max(0)
+        (effective_quota as i64 - used as i64).max(0)
     };
 
     Ok(Json(serde_json::json!({
@@ -141,7 +148,7 @@ pub async fn usage_handler(
         "prompt_tokens":      info.prompt_tokens,
         "completion_tokens":  info.completion_tokens,
         "requests":           info.request_count,
-        "quota":              quota,
+        "quota":              effective_quota,
         "quota_remaining":    remaining,
     })))
 }
@@ -217,16 +224,24 @@ async fn proxy_request(
         return Err(GatewayError::ShuttingDown);
     }
 
+    // ── Per-key metadata (one DashMap lookup — O(1), no await) ───────────────
+    let key_hash = sha256_hex(&api_key);
+    let key_meta = state.key_store.lookup(&key_hash);
+
     // ── Rate limit (per-IP GCRA) ─────────────────────────────────────────────
     if !state.rate_limiters.check(client_ip) {
         state.metrics.rate_limited.inc();
         return Err(GatewayError::RateLimited);
     }
 
-    // ── Daily quota check ────────────────────────────────────────────────────
-    if !state.quota.is_allowed(&api_key) {
-        state.metrics.quota_exceeded.inc();
-        return Err(GatewayError::QuotaExceeded);
+    // ── Per-key RPM limit ────────────────────────────────────────────────────
+    if let Some(ref meta) = key_meta {
+        if let Some(rpm) = meta.rpm_limit {
+            if !state.rate_limiters.check_key(&key_hash, rpm as u32) {
+                state.metrics.rate_limited.inc();
+                return Err(GatewayError::RateLimited);
+            }
+        }
     }
 
     // ── Parse request body ───────────────────────────────────────────────────
@@ -242,6 +257,23 @@ async fn proxy_request(
         .and_then(|v| v.as_str())
         .unwrap_or(&state.config.served_model_name)
         .to_string();
+
+    // ── Model allowlist ──────────────────────────────────────────────────────
+    if let Some(ref meta) = key_meta {
+        if !meta.allowed_models.is_empty() && !meta.allowed_models.contains(&model) {
+            return Err(GatewayError::Forbidden(format!(
+                "model '{}' is not in the allowlist for this API key",
+                model
+            )));
+        }
+    }
+
+    // ── Daily quota check (per-key override or global) ───────────────────────
+    let per_key_limit = key_meta.as_ref().and_then(|m| m.daily_token_limit.map(|l| l as u64));
+    if !state.quota.is_allowed(&api_key, per_key_limit) {
+        state.metrics.quota_exceeded.inc();
+        return Err(GatewayError::QuotaExceeded);
+    }
 
     // Rewrite model name to the served model — but leave LoRA aliases untouched
     // so vLLM routes to the correct adapter.
@@ -662,7 +694,20 @@ async fn proxy_post_simple(
         state.metrics.rate_limited.inc();
         return Err(GatewayError::RateLimited);
     }
-    if !state.quota.is_allowed(&api_key) {
+
+    // Per-key RPM + daily limit (same logic as proxy_request)
+    let key_hash = sha256_hex(&api_key);
+    let key_meta = state.key_store.lookup(&key_hash);
+    if let Some(ref meta) = key_meta {
+        if let Some(rpm) = meta.rpm_limit {
+            if !state.rate_limiters.check_key(&key_hash, rpm as u32) {
+                state.metrics.rate_limited.inc();
+                return Err(GatewayError::RateLimited);
+            }
+        }
+    }
+    let per_key_limit = key_meta.as_ref().and_then(|m| m.daily_token_limit.map(|l| l as u64));
+    if !state.quota.is_allowed(&api_key, per_key_limit) {
         state.metrics.quota_exceeded.inc();
         return Err(GatewayError::QuotaExceeded);
     }

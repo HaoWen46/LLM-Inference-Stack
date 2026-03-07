@@ -78,14 +78,18 @@ impl QuotaStore {
 
     /// Check whether the key has remaining quota. Does not charge tokens.
     /// Returns `true` if the request is allowed (includes unlimited case).
-    pub fn is_allowed(&self, api_key: &str) -> bool {
-        if self.daily_quota == 0 {
+    ///
+    /// `per_key_limit` overrides the global `daily_quota` when `Some`.
+    /// A limit of `0` (from either source) means unlimited.
+    pub fn is_allowed(&self, api_key: &str, per_key_limit: Option<u64>) -> bool {
+        let limit = per_key_limit.unwrap_or(self.daily_quota);
+        if limit == 0 {
             return true;
         }
         let hash = hash_key(api_key);
         let today_str = today();
         match self.cache.get(&hash) {
-            Some(entry) if entry.date == today_str => entry.tokens < self.daily_quota,
+            Some(entry) if entry.date == today_str => entry.tokens < limit,
             // No entry means 0 tokens used today → allowed
             _ => true,
         }

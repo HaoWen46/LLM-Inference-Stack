@@ -4,7 +4,7 @@
 ///   - Hot path: DashMap lookup (O(1), no await, no allocations beyond clone)
 ///   - Admin ops: touch PostgreSQL, then update/invalidate cache atomically
 ///   - Background task refreshes cache from DB every 60 seconds
-///   - Keys stored as SHA-256 hex hashes — plaintext never persisted
+///   - Keys stored as SHA-256 hashes — plaintext never persisted
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
@@ -16,12 +16,23 @@ use tokio::time::{sleep, Duration};
 use tracing::{error, info};
 use uuid::Uuid;
 
+// ── Cached key (hot-path struct) ──────────────────────────────────────────────
+
 #[derive(Clone)]
 pub struct CachedKey {
     pub id: Uuid,
     pub label: String,
     pub expires_at: Option<DateTime<Utc>>,
+    /// Per-key RPM limit — None means use global RATE_LIMIT_PER_MINUTE.
+    pub rpm_limit: Option<i32>,
+    /// Per-key daily token limit — None means use global DAILY_TOKEN_QUOTA.
+    pub daily_token_limit: Option<i64>,
+    /// Allowed model IDs — empty means all models allowed.
+    pub allowed_models: Vec<String>,
+    pub org_id: Option<Uuid>,
 }
+
+// ── Full key entry (returned by list()) ───────────────────────────────────────
 
 pub struct KeyEntry {
     pub id: Uuid,
@@ -31,7 +42,49 @@ pub struct KeyEntry {
     pub expires_at: Option<DateTime<Utc>>,
     pub enabled: bool,
     pub last_used_at: Option<DateTime<Utc>>,
+    pub rpm_limit: Option<i32>,
+    pub daily_token_limit: Option<i64>,
+    pub allowed_models: Vec<String>,
+    pub org_id: Option<Uuid>,
 }
+
+// ── Options for creating / updating keys ─────────────────────────────────────
+
+pub struct CreateKeyOptions {
+    pub label: String,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub rpm_limit: Option<i32>,
+    pub daily_token_limit: Option<i64>,
+    pub allowed_models: Vec<String>,
+    pub org_id: Option<Uuid>,
+}
+
+/// PUT /admin/keys/:id/limits — replace all limit fields (PUT semantics).
+pub struct KeyLimits {
+    pub expires_at: Option<DateTime<Utc>>,
+    pub rpm_limit: Option<i32>,
+    pub daily_token_limit: Option<i64>,
+    pub allowed_models: Vec<String>,
+    pub org_id: Option<Uuid>,
+}
+
+// ── Org types ─────────────────────────────────────────────────────────────────
+
+pub struct OrgEntry {
+    pub id: Uuid,
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+}
+
+pub struct OrgUsage {
+    pub date: String,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub request_count: i64,
+    pub key_count: i64,
+}
+
+// ── KeyStore ──────────────────────────────────────────────────────────────────
 
 pub struct KeyStore {
     pool: PgPool,
@@ -76,16 +129,22 @@ impl KeyStore {
     }
 
     async fn reload_cache(&self) -> Result<()> {
-        let rows: Vec<(Uuid, String, String, Option<DateTime<Utc>>)> = sqlx::query_as(
-            "SELECT id, key_hash, label, expires_at FROM api_keys WHERE enabled = true",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        let rows: Vec<(Uuid, String, String, Option<DateTime<Utc>>, Option<i32>, Option<i64>, Vec<String>, Option<Uuid>)> =
+            sqlx::query_as(
+                "SELECT id, key_hash, label, expires_at, rpm_limit, daily_token_limit, \
+                        allowed_models, org_id \
+                 FROM api_keys WHERE enabled = true",
+            )
+            .fetch_all(&self.pool)
+            .await?;
 
         self.cache.clear();
         let count = rows.len();
-        for (id, key_hash, label, expires_at) in rows {
-            self.cache.insert(key_hash, CachedKey { id, label, expires_at });
+        for (id, key_hash, label, expires_at, rpm_limit, daily_token_limit, allowed_models, org_id) in rows {
+            self.cache.insert(
+                key_hash,
+                CachedKey { id, label, expires_at, rpm_limit, daily_token_limit, allowed_models, org_id },
+            );
         }
         info!(keys = count, "key cache reloaded");
         Ok(())
@@ -98,42 +157,72 @@ impl KeyStore {
 
     /// Create a new key. Returns `(id, created_at, plaintext_key)`.
     /// The plaintext is shown exactly once and never stored.
-    pub async fn create(&self, label: &str) -> Result<(Uuid, DateTime<Utc>, String)> {
+    pub async fn create(&self, opts: CreateKeyOptions) -> Result<(Uuid, DateTime<Utc>, String)> {
         let plaintext = generate_key();
         let hash = sha256_hex(&plaintext);
 
         let (id, created_at): (Uuid, DateTime<Utc>) = sqlx::query_as(
-            "INSERT INTO api_keys (key_hash, label) VALUES ($1, $2) RETURNING id, created_at",
+            "INSERT INTO api_keys \
+             (key_hash, label, expires_at, rpm_limit, daily_token_limit, allowed_models, org_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             RETURNING id, created_at",
         )
         .bind(&hash)
-        .bind(label)
+        .bind(&opts.label)
+        .bind(opts.expires_at)
+        .bind(opts.rpm_limit)
+        .bind(opts.daily_token_limit)
+        .bind(&opts.allowed_models)
+        .bind(opts.org_id)
         .fetch_one(&self.pool)
         .await?;
 
-        self.cache.insert(hash, CachedKey { id, label: label.to_string(), expires_at: None });
+        self.cache.insert(
+            hash,
+            CachedKey {
+                id,
+                label: opts.label,
+                expires_at: opts.expires_at,
+                rpm_limit: opts.rpm_limit,
+                daily_token_limit: opts.daily_token_limit,
+                allowed_models: opts.allowed_models,
+                org_id: opts.org_id,
+            },
+        );
         Ok((id, created_at, plaintext))
     }
 
     pub async fn list(&self) -> Result<Vec<KeyEntry>> {
-        let rows: Vec<(Uuid, String, String, DateTime<Utc>, Option<DateTime<Utc>>, bool, Option<DateTime<Utc>>)> =
-            sqlx::query_as(
-                "SELECT id, key_hash, label, created_at, expires_at, enabled, last_used_at \
-                 FROM api_keys ORDER BY created_at DESC",
-            )
-            .fetch_all(&self.pool)
-            .await?;
+        let rows: Vec<(
+            Uuid, String, String, DateTime<Utc>,
+            Option<DateTime<Utc>>, bool, Option<DateTime<Utc>>,
+            Option<i32>, Option<i64>, Vec<String>, Option<Uuid>,
+        )> = sqlx::query_as(
+            "SELECT id, key_hash, label, created_at, expires_at, enabled, last_used_at, \
+                    rpm_limit, daily_token_limit, allowed_models, org_id \
+             FROM api_keys ORDER BY created_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
 
         Ok(rows
             .into_iter()
-            .map(|(id, key_hash, label, created_at, expires_at, enabled, last_used_at)| KeyEntry {
-                id,
-                key_hash,
-                label,
-                created_at,
-                expires_at,
-                enabled,
-                last_used_at,
-            })
+            .map(
+                |(id, key_hash, label, created_at, expires_at, enabled, last_used_at,
+                  rpm_limit, daily_token_limit, allowed_models, org_id)| KeyEntry {
+                    id,
+                    key_hash,
+                    label,
+                    created_at,
+                    expires_at,
+                    enabled,
+                    last_used_at,
+                    rpm_limit,
+                    daily_token_limit,
+                    allowed_models,
+                    org_id,
+                },
+            )
             .collect())
     }
 
@@ -149,6 +238,41 @@ impl KeyStore {
             return Ok(false);
         }
         self.reload_cache().await?;
+        Ok(true)
+    }
+
+    /// Update per-key limits (PUT semantics — replaces all limit fields).
+    /// Returns `false` if the id was not found.
+    pub async fn update_limits(&self, id: Uuid, limits: KeyLimits) -> Result<bool> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "UPDATE api_keys \
+             SET expires_at = $2, rpm_limit = $3, daily_token_limit = $4, \
+                 allowed_models = $5, org_id = $6 \
+             WHERE id = $1 \
+             RETURNING key_hash",
+        )
+        .bind(id)
+        .bind(limits.expires_at)
+        .bind(limits.rpm_limit)
+        .bind(limits.daily_token_limit)
+        .bind(&limits.allowed_models)
+        .bind(limits.org_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let key_hash = match row {
+            Some((h,)) => h,
+            None => return Ok(false),
+        };
+
+        // Update in-place to avoid a full reload
+        if let Some(mut entry) = self.cache.get_mut(&key_hash) {
+            entry.expires_at = limits.expires_at;
+            entry.rpm_limit = limits.rpm_limit;
+            entry.daily_token_limit = limits.daily_token_limit;
+            entry.allowed_models = limits.allowed_models;
+            entry.org_id = limits.org_id;
+        }
         Ok(true)
     }
 
@@ -199,6 +323,65 @@ impl KeyStore {
                 }
             }
         });
+    }
+
+    // ── Org operations ────────────────────────────────────────────────────────
+
+    pub async fn create_org(&self, name: &str) -> Result<OrgEntry> {
+        let (id, created_at): (Uuid, DateTime<Utc>) = sqlx::query_as(
+            "INSERT INTO orgs (name) VALUES ($1) RETURNING id, created_at",
+        )
+        .bind(name)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(OrgEntry { id, name: name.to_string(), created_at })
+    }
+
+    pub async fn list_orgs(&self) -> Result<Vec<OrgEntry>> {
+        let rows: Vec<(Uuid, String, DateTime<Utc>)> =
+            sqlx::query_as("SELECT id, name, created_at FROM orgs ORDER BY created_at DESC")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, name, created_at)| OrgEntry { id, name, created_at })
+            .collect())
+    }
+
+    /// Aggregate token usage for all keys belonging to `org_id` on `date`.
+    pub async fn get_org_usage(&self, org_id: Uuid, date: &str) -> Result<OrgUsage> {
+        let row: Option<(i64, i64, i64, i64)> = sqlx::query_as(
+            "SELECT \
+                 COALESCE(SUM(tu.prompt_tokens), 0)::BIGINT, \
+                 COALESCE(SUM(tu.completion_tokens), 0)::BIGINT, \
+                 COALESCE(SUM(tu.request_count), 0)::BIGINT, \
+                 COUNT(DISTINCT ak.id)::BIGINT \
+             FROM api_keys ak \
+             LEFT JOIN token_usage tu \
+                 ON tu.key_hash = ak.key_hash AND tu.date = $2::date \
+             WHERE ak.org_id = $1",
+        )
+        .bind(org_id)
+        .bind(date)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(match row {
+            Some((prompt, completion, reqs, keys)) => OrgUsage {
+                date: date.to_string(),
+                prompt_tokens: prompt,
+                completion_tokens: completion,
+                request_count: reqs,
+                key_count: keys,
+            },
+            None => OrgUsage {
+                date: date.to_string(),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                request_count: 0,
+                key_count: 0,
+            },
+        })
     }
 }
 
