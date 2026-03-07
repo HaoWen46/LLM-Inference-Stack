@@ -57,7 +57,7 @@ def chat(client: httpx.Client, key: str, system: str, user: str,
         f"{GATEWAY}/v1/chat/completions",
         headers=headers(key),
         json=payload,
-        timeout=120,
+        timeout=300,
     )
     elapsed = time.perf_counter() - t0
     r.raise_for_status()
@@ -196,8 +196,104 @@ def run(key: str):
         print(content)
         print(f"\n  [{usage['prompt_tokens']}p + {usage['completion_tokens']}c | {usage['elapsed_s']}s | {usage['tok_per_s']} tok/s]")
 
+        # ── Tokenize / Detokenize ─────────────────────────────────────
+        section("7. Tokenize + Detokenize")
+        tok_payload = {
+            "model": "Qwen/Qwen3.5-27B",
+            "prompt": "Hello, world! This is a tokenization test.",
+        }
+        r = client.post(f"{GATEWAY}/v1/tokenize", headers=headers(key), json=tok_payload, timeout=15)
+        if r.is_success:
+            tok_body = r.json()
+            tokens = tok_body.get("tokens", [])
+            print(f"  tokenize: {len(tokens)} tokens → {tokens[:10]}{'...' if len(tokens) > 10 else ''}")
+            det_payload = {"model": "Qwen/Qwen3.5-27B", "tokens": tokens}
+            r2 = client.post(f"{GATEWAY}/v1/detokenize", headers=headers(key), json=det_payload, timeout=15)
+            if r2.is_success:
+                recovered = r2.json().get("prompt", "")
+                print(f"  detokenize: '{recovered}'")
+            else:
+                print(f"  detokenize FAIL ({r2.status_code}): {r2.text[:200]}")
+        else:
+            print(f"  tokenize FAIL ({r.status_code}): {r.text[:200]}")
+
+        # ── Embeddings ────────────────────────────────────────────────
+        section("8. Embeddings")
+        emb_payload = {"model": "Qwen/Qwen3.5-27B", "input": "The sky is blue."}
+        r = client.post(f"{GATEWAY}/v1/embeddings", headers=headers(key), json=emb_payload, timeout=30)
+        if r.is_success:
+            emb = r.json()["data"][0]["embedding"]
+            print(f"  embedding dim: {len(emb)}  first 5: {emb[:5]}")
+        else:
+            print(f"  NOTE: embeddings not supported with this model (status {r.status_code})")
+            print(f"  Response: {r.text[:300]}")
+
+        # ── Batch API ─────────────────────────────────────────────────
+        section("9. Batch API")
+        batch_payload = {
+            "requests": [
+                {
+                    "custom_id": "req-1",
+                    "method": "POST",
+                    "url": "/v1/chat/completions",
+                    "body": {
+                        "model": "Qwen/Qwen3.5-27B",
+                        "messages": [
+                            {"role": "system", "content": "One sentence only."},
+                            {"role": "user", "content": "What is 2 + 2?"},
+                        ],
+                        "max_tokens": 32,
+                        "chat_template_kwargs": {"enable_thinking": False},
+                    },
+                },
+                {
+                    "custom_id": "req-2",
+                    "method": "POST",
+                    "url": "/v1/chat/completions",
+                    "body": {
+                        "model": "Qwen/Qwen3.5-27B",
+                        "messages": [
+                            {"role": "system", "content": "One sentence only."},
+                            {"role": "user", "content": "Name the capital of France."},
+                        ],
+                        "max_tokens": 32,
+                        "chat_template_kwargs": {"enable_thinking": False},
+                    },
+                },
+            ],
+        }
+        r = client.post(f"{GATEWAY}/v1/batches", headers=headers(key), json=batch_payload, timeout=15)
+        if not r.is_success:
+            print(f"  create batch FAIL ({r.status_code}): {r.text[:300]}")
+        else:
+            batch = r.json()
+            batch_id = batch["id"]
+            print(f"  batch created: {batch_id}  status={batch['status']}  total={batch['total_requests']}")
+            # Poll until complete (up to 120s)
+            for attempt in range(24):
+                time.sleep(5)
+                r2 = client.get(f"{GATEWAY}/v1/batches/{batch_id}", headers=headers(key), timeout=10)
+                b2 = r2.json()
+                status = b2["status"]
+                print(f"  poll [{attempt+1}]: status={status}  done={b2['completed_count']}/{b2['total_requests']}")
+                if status in ("completed", "failed", "cancelled"):
+                    break
+            # Fetch results
+            r3 = client.get(f"{GATEWAY}/v1/batches/{batch_id}/results", headers=headers(key), timeout=10)
+            if r3.is_success:
+                for item in r3.json().get("data", []):
+                    cid = item["custom_id"]
+                    answer = (
+                        item["body"]["choices"][0]["message"].get("content", "").strip()
+                        if item.get("body")
+                        else f"ERROR: {item.get('error')}"
+                    )
+                    print(f"  {cid}: {answer}")
+            else:
+                print(f"  results FAIL ({r3.status_code}): {r3.text[:200]}")
+
         # ── Usage endpoint ────────────────────────────────────────
-        section("7. Per-key usage quota")
+        section("10. Per-key usage quota")
         r = client.get(f"{GATEWAY}/v1/usage", headers=headers(key), timeout=10)
         print(json.dumps(r.json(), indent=2))
 

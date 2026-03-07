@@ -243,8 +243,11 @@ async fn proxy_request(
         .unwrap_or(&state.config.served_model_name)
         .to_string();
 
-    // Rewrite model name to whatever vLLM is actually serving
-    body["model"] = Value::String(state.config.served_model_name.clone());
+    // Rewrite model name to the served model — but leave LoRA aliases untouched
+    // so vLLM routes to the correct adapter.
+    if !state.config.lora_aliases.contains(&model) {
+        body["model"] = Value::String(state.config.served_model_name.clone());
+    }
 
     state.metrics.active_requests.inc();
     state.metrics.inflight_requests.inc();
@@ -628,5 +631,210 @@ async fn stream_proxy(
         .header("x-accel-buffering", "no")
         .header("connection", "keep-alive")
         .body(Body::from_stream(stream))
+        .unwrap())
+}
+
+// ── Embeddings ───────────────────────────────────────────────────────────────
+
+/// POST /v1/embeddings — auth + rate limit + quota; proxies to vLLM as-is.
+pub async fn embeddings_handler(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    ApiKey(api_key): ApiKey,
+    body: Bytes,
+) -> Result<Response, GatewayError> {
+    proxy_post_simple(state, api_key, addr.ip(), body, "/v1/embeddings").await
+}
+
+/// Non-streaming proxy for endpoints that never stream (embeddings).
+/// Does NOT rewrite model name so a dedicated embedding model can be used.
+async fn proxy_post_simple(
+    state: Arc<AppState>,
+    api_key: String,
+    client_ip: std::net::IpAddr,
+    raw_body: Bytes,
+    path: &'static str,
+) -> Result<Response, GatewayError> {
+    if state.shutting_down.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(GatewayError::ShuttingDown);
+    }
+    if !state.rate_limiters.check(client_ip) {
+        state.metrics.rate_limited.inc();
+        return Err(GatewayError::RateLimited);
+    }
+    if !state.quota.is_allowed(&api_key) {
+        state.metrics.quota_exceeded.inc();
+        return Err(GatewayError::QuotaExceeded);
+    }
+
+    let body: Value = serde_json::from_slice(&raw_body)
+        .map_err(|e| GatewayError::BadRequest(e.to_string()))?;
+    let model = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&state.config.served_model_name)
+        .to_string();
+
+    state.circuit_breaker.before_call()?;
+    let start = Instant::now();
+
+    let upstream_url = format!("{}{}", state.config.vllm_url, path);
+    let resp = state
+        .client
+        .post(&upstream_url)
+        .header(
+            "Authorization",
+            format!("Bearer {}", state.config.vllm_api_key),
+        )
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            state.circuit_breaker.on_failure();
+            if e.is_timeout() {
+                GatewayError::UpstreamTimeout
+            } else {
+                GatewayError::UpstreamError(e.to_string())
+            }
+        })?;
+
+    let status = resp.status();
+    let duration = start.elapsed().as_secs_f64();
+
+    if status.is_server_error() {
+        state.circuit_breaker.on_failure();
+    } else {
+        state.circuit_breaker.on_success();
+    }
+
+    let body_bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| GatewayError::UpstreamError(e.to_string()))?;
+
+    let prompt_tokens = serde_json::from_slice::<Value>(&body_bytes)
+        .ok()
+        .and_then(|v| v.pointer("/usage/prompt_tokens").and_then(|t| t.as_u64()))
+        .unwrap_or(0);
+
+    if prompt_tokens > 0 {
+        state.quota.add_tokens(&api_key, prompt_tokens, 0);
+        state
+            .metrics
+            .tokens_prompted
+            .get_or_create(&ModelLabel {
+                model: model.clone(),
+            })
+            .inc_by(prompt_tokens);
+    }
+
+    state
+        .metrics
+        .request_count
+        .get_or_create(&RequestLabels {
+            method: "POST".into(),
+            endpoint: path.to_string(),
+            status_code: status.as_str().to_string(),
+            model: model.clone(),
+        })
+        .inc_by(1);
+
+    state
+        .metrics
+        .request_latency
+        .get_or_create(&EndpointModelLabels {
+            endpoint: path.to_string(),
+            model,
+        })
+        .observe(duration);
+
+    info!(
+        status = status.as_u16(),
+        duration_ms = (duration * 1000.0) as u64,
+        prompt_tokens,
+        "request complete"
+    );
+
+    let axum_status =
+        StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    Ok(Response::builder()
+        .status(axum_status)
+        .header("content-type", "application/json")
+        .body(Body::from(body_bytes))
+        .unwrap())
+}
+
+// ── Tokenize / Detokenize ─────────────────────────────────────────────────────
+
+/// POST /v1/tokenize — auth-gated passthrough to vLLM /tokenize (no quota).
+pub async fn tokenize_handler(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    ApiKey(_api_key): ApiKey,
+    body: Bytes,
+) -> Result<Response, GatewayError> {
+    passthrough_post(state, addr.ip(), body, "/tokenize").await
+}
+
+/// POST /v1/detokenize — auth-gated passthrough to vLLM /detokenize (no quota).
+pub async fn detokenize_handler(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    ApiKey(_api_key): ApiKey,
+    body: Bytes,
+) -> Result<Response, GatewayError> {
+    passthrough_post(state, addr.ip(), body, "/detokenize").await
+}
+
+/// Auth + rate-limit passthrough — rewrites model name, no quota tracking.
+async fn passthrough_post(
+    state: Arc<AppState>,
+    client_ip: std::net::IpAddr,
+    raw_body: Bytes,
+    vllm_path: &'static str,
+) -> Result<Response, GatewayError> {
+    if state.shutting_down.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(GatewayError::ShuttingDown);
+    }
+    if !state.rate_limiters.check(client_ip) {
+        state.metrics.rate_limited.inc();
+        return Err(GatewayError::RateLimited);
+    }
+
+    // Rewrite model to served_model_name so vLLM uses the right tokenizer.
+    let mut body: Value = serde_json::from_slice(&raw_body)
+        .map_err(|e| GatewayError::BadRequest(e.to_string()))?;
+    body["model"] = Value::String(state.config.served_model_name.clone());
+
+    let upstream_url = format!("{}{}", state.config.vllm_url, vllm_path);
+    let resp = state
+        .client
+        .post(&upstream_url)
+        .header(
+            "Authorization",
+            format!("Bearer {}", state.config.vllm_api_key),
+        )
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            if e.is_timeout() {
+                GatewayError::UpstreamTimeout
+            } else {
+                GatewayError::UpstreamError(e.to_string())
+            }
+        })?;
+
+    let status_code =
+        StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let body_bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| GatewayError::UpstreamError(e.to_string()))?;
+
+    Ok(Response::builder()
+        .status(status_code)
+        .header("content-type", "application/json")
+        .body(Body::from(body_bytes))
         .unwrap())
 }

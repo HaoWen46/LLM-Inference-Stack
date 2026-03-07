@@ -43,6 +43,11 @@ pub struct Config {
 
     // ── Local model cache ─────────────────────────────────────────────────────
     pub model_cache_dir: String,
+
+    // ── LoRA aliases ──────────────────────────────────────────────────────────
+    /// Alias names parsed from LORA_MODULES="alias1=path1 alias2=path2".
+    /// Requests with model matching one of these are forwarded as-is (not rewritten).
+    pub lora_aliases: Vec<String>,
 }
 
 impl Config {
@@ -76,6 +81,7 @@ impl Config {
             cb_half_open_max_calls: env_u64("CB_HALF_OPEN_MAX_CALLS", 1),
             daily_token_quota: env_u64("DAILY_TOKEN_QUOTA", 0),
             model_cache_dir: env_or("MODEL_CACHE_DIR", "models"),
+            lora_aliases: parse_lora_aliases(&env_or("LORA_MODULES", "")),
         })
     }
 }
@@ -103,6 +109,14 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+/// Parse "alias1=path1 alias2=path2" → ["alias1", "alias2"]
+fn parse_lora_aliases(lora_modules: &str) -> Vec<String> {
+    lora_modules
+        .split_whitespace()
+        .filter_map(|entry| entry.split_once('=').map(|(alias, _)| alias.to_string()))
+        .collect()
 }
 
 fn env_bool(key: &str, default: bool) -> bool {

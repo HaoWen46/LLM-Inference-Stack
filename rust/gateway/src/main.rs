@@ -4,6 +4,7 @@
 //! Reads configuration exclusively from environment variables (no dotenv).
 mod admin;
 mod auth;
+mod batches;
 mod circuit_breaker;
 mod config;
 mod error;
@@ -14,6 +15,7 @@ mod quota;
 mod rate_limiter;
 mod tracing_setup;
 
+use sqlx::PgPool;
 use std::{
     net::SocketAddr,
     sync::{atomic::AtomicBool, Arc},
@@ -53,6 +55,8 @@ pub struct AppState {
     pub quota: Arc<QuotaStore>,
     pub key_store: Arc<KeyStore>,
     pub metrics: Arc<AppMetrics>,
+    /// PostgreSQL pool — used by batch workers and admin handlers.
+    pub db_pool: PgPool,
     /// Set to true once vLLM has responded healthy (warmup complete).
     pub warmed_up: Arc<AtomicBool>,
     /// Set to true on SIGTERM/Ctrl-C; new proxy requests return 503.
@@ -123,6 +127,7 @@ async fn main() -> anyhow::Result<()> {
         quota,
         key_store,
         metrics: app_metrics.clone(),
+        db_pool: pool.clone(),
         warmed_up: warmed_up.clone(),
         shutting_down: shutting_down.clone(),
     });
@@ -195,6 +200,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/models", get(proxy::models_handler))
         .route("/v1/chat/completions", post(proxy::chat_completions_handler))
         .route("/v1/completions", post(proxy::completions_handler))
+        .route("/v1/embeddings", post(proxy::embeddings_handler))
+        .route("/v1/tokenize", post(proxy::tokenize_handler))
+        .route("/v1/detokenize", post(proxy::detokenize_handler))
+        .nest("/v1/batches", batches::router())
         // ── Global middleware ─────────────────────────────────────────────────
         .layer(DefaultBodyLimit::max(4 * 1024 * 1024)) // 4 MB — rejects oversized bodies
         .layer(middleware)
