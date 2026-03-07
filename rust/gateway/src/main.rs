@@ -4,6 +4,7 @@
 //! Reads configuration exclusively from environment variables (no dotenv).
 mod admin;
 mod auth;
+mod backends;
 mod batches;
 mod circuit_breaker;
 mod config;
@@ -35,7 +36,7 @@ use tower_http::{request_id::MakeRequestUuid, trace::TraceLayer, ServiceBuilderE
 use tracing::info;
 
 use crate::{
-    circuit_breaker::CircuitBreaker,
+    backends::BackendRouter,
     config::Config,
     error::GatewayError,
     keys::KeyStore,
@@ -48,16 +49,17 @@ use crate::{
 
 pub struct AppState {
     pub config: Arc<Config>,
-    /// Persistent HTTP/2 connection pool to vLLM.
+    /// Persistent HTTP/2 connection pool shared by all upstream calls.
     pub client: reqwest::Client,
-    pub circuit_breaker: Arc<CircuitBreaker>,
+    /// Multi-backend router with per-backend circuit breakers and health state.
+    pub backend_router: Arc<BackendRouter>,
     pub rate_limiters: Arc<RateLimiterMap>,
     pub quota: Arc<QuotaStore>,
     pub key_store: Arc<KeyStore>,
     pub metrics: Arc<AppMetrics>,
     /// PostgreSQL pool — used by batch workers and admin handlers.
     pub db_pool: PgPool,
-    /// Set to true once vLLM has responded healthy (warmup complete).
+    /// Set to true once the primary backend has responded healthy (warmup complete).
     pub warmed_up: Arc<AtomicBool>,
     /// Set to true on SIGTERM/Ctrl-C; new proxy requests return 503.
     pub shutting_down: Arc<AtomicBool>,
@@ -70,7 +72,11 @@ async fn main() -> anyhow::Result<()> {
     let config = Arc::new(Config::from_env()?);
     tracing_setup::init(&config)?;
 
-    info!(version = env!("CARGO_PKG_VERSION"), "gateway starting");
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        backends = config.backends.len(),
+        "gateway starting"
+    );
 
     // ── PostgreSQL connection pool ────────────────────────────────────────────
     let pool = sqlx::PgPool::connect(&config.database_url).await?;
@@ -96,13 +102,6 @@ async fn main() -> anyhow::Result<()> {
     // ── Metrics ──────────────────────────────────────────────────────────────
     let app_metrics = AppMetrics::new();
 
-    // ── Circuit breaker ───────────────────────────────────────────────────────
-    let circuit_breaker = Arc::new(CircuitBreaker::new(
-        config.cb_failure_threshold,
-        config.cb_recovery_timeout_secs,
-        config.cb_half_open_max_calls,
-    ));
-
     // ── Rate limiter ──────────────────────────────────────────────────────────
     let rate_limiters = Arc::new(RateLimiterMap::new(config.rate_limit_per_minute));
     rate_limiters.start_cleanup_task();
@@ -116,13 +115,31 @@ async fn main() -> anyhow::Result<()> {
         .use_rustls_tls()
         .build()?;
 
+    // ── Backend router (per-backend CB + health checks) ───────────────────────
+    let backend_router = BackendRouter::new(
+        config.backends.clone(),
+        config.cb_failure_threshold,
+        config.cb_recovery_timeout_secs,
+        config.cb_half_open_max_calls,
+    );
+    backend_router.start_health_task(client.clone());
+
+    for b in &backend_router.backends {
+        info!(
+            url = %b.url,
+            models = ?b.models,
+            weight = b.weight,
+            "backend registered"
+        );
+    }
+
     let warmed_up = Arc::new(AtomicBool::new(false));
     let shutting_down = Arc::new(AtomicBool::new(false));
 
     let state = Arc::new(AppState {
         config: config.clone(),
         client: client.clone(),
-        circuit_breaker: circuit_breaker.clone(),
+        backend_router,
         rate_limiters,
         quota,
         key_store,
@@ -167,13 +184,10 @@ fn build_router(state: Arc<AppState>) -> Router {
     use tower::ServiceBuilder;
     use tower_http::set_header::SetResponseHeaderLayer;
 
-    // All global middleware in one ServiceBuilder so the response-header layers
-    // run in the same proven chain as TraceLayer/RequestId (which already work).
     let middleware = ServiceBuilder::new()
         .set_x_request_id(MakeRequestUuid)
         .propagate_x_request_id()
         .layer(TraceLayer::new_for_http())
-        // Security headers — added to every response after tracing is recorded.
         .layer(SetResponseHeaderLayer::overriding(
             header::HeaderName::from_static("x-content-type-options"),
             HeaderValue::from_static("nosniff"),
@@ -205,7 +219,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/detokenize", post(proxy::detokenize_handler))
         .nest("/v1/batches", batches::router())
         // ── Global middleware ─────────────────────────────────────────────────
-        .layer(DefaultBodyLimit::max(4 * 1024 * 1024)) // 4 MB — rejects oversized bodies
+        .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
         .layer(middleware)
         .with_state(state)
 }
@@ -221,13 +235,18 @@ async fn ready_handler(
 ) -> Result<impl IntoResponse, GatewayError> {
     if !state.warmed_up.load(std::sync::atomic::Ordering::Relaxed) {
         return Err(GatewayError::BadRequest(
-            "warming up — vLLM not yet healthy".into(),
+            "warming up — primary backend not yet healthy".into(),
         ));
     }
 
+    let backend = state
+        .backend_router
+        .primary()
+        .ok_or_else(|| GatewayError::UpstreamError("no backends configured".into()))?;
+
     let resp = state
         .client
-        .get(format!("{}/health", state.config.vllm_url))
+        .get(format!("{}/health", backend.url))
         .timeout(Duration::from_secs(3))
         .send()
         .await
@@ -236,7 +255,7 @@ async fn ready_handler(
     if resp.status().is_success() {
         Ok((StatusCode::OK, Json(serde_json::json!({"status": "ready"}))))
     } else {
-        Err(GatewayError::UpstreamError("vLLM upstream unhealthy".into()))
+        Err(GatewayError::UpstreamError("primary backend unhealthy".into()))
     }
 }
 
@@ -252,7 +271,16 @@ async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRespons
 // ── Warmup task ───────────────────────────────────────────────────────────────
 
 async fn warmup(state: Arc<AppState>) {
-    let url = format!("{}/health", state.config.vllm_url);
+    let backend = match state.backend_router.primary() {
+        Some(b) => b,
+        None => {
+            tracing::warn!("no backends configured — skipping warmup");
+            state.warmed_up.store(true, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+    };
+
+    let url = format!("{}/health", backend.url);
     for attempt in 0..60u32 {
         match state
             .client
@@ -265,14 +293,13 @@ async fn warmup(state: Arc<AppState>) {
                 state
                     .warmed_up
                     .store(true, std::sync::atomic::Ordering::Relaxed);
-                info!(attempts = attempt + 1, "gateway ready — vLLM healthy");
+                info!(attempts = attempt + 1, url = %url, "gateway ready — primary backend healthy");
                 return;
             }
             _ => {}
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
-    // Unblock regardless — let requests fail naturally
     state
         .warmed_up
         .store(true, std::sync::atomic::Ordering::Relaxed);

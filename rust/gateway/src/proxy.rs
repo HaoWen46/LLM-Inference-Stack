@@ -9,12 +9,13 @@ use axum::{
 use bytes::Bytes;
 use futures::StreamExt;
 use serde_json::Value;
-use std::{net::SocketAddr, path::Path, sync::Arc, time::Instant};
+use std::{collections::HashSet, net::SocketAddr, path::Path, sync::Arc, time::Instant};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, warn};
 
 use crate::{
     auth::ApiKey,
+    backends::Backend,
     error::GatewayError,
     keys::sha256_hex,
     metrics::{EndpointModelLabels, ModelLabel, RequestLabels, StatusCodeLabel},
@@ -153,7 +154,7 @@ pub async fn usage_handler(
     })))
 }
 
-/// GET /v1/models — passthrough to vLLM
+/// GET /v1/models — fan-out to all healthy backends, merge and deduplicate results.
 pub async fn models_handler(
     State(state): State<Arc<AppState>>,
     ApiKey(_api_key): ApiKey,
@@ -162,30 +163,52 @@ pub async fn models_handler(
         return Err(GatewayError::ShuttingDown);
     }
 
-    let resp = state
-        .client
-        .get(format!("{}/v1/models", state.config.vllm_url))
-        .header(
-            "Authorization",
-            format!("Bearer {}", state.config.vllm_api_key),
-        )
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
-        .map_err(|e| GatewayError::UpstreamError(e.to_string()))?;
+    let backends = state.backend_router.healthy_backends();
+    if backends.is_empty() {
+        return Err(GatewayError::UpstreamError("no healthy backends available".into()));
+    }
 
-    let status = StatusCode::from_u16(resp.status().as_u16())
-        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    let body_bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| GatewayError::UpstreamError(e.to_string()))?;
+    let mut all_data: Vec<Value> = Vec::new();
+    let mut seen_ids: HashSet<String> = HashSet::new();
 
-    Ok(Response::builder()
-        .status(status)
-        .header("content-type", "application/json")
-        .body(Body::from(body_bytes))
-        .unwrap())
+    for backend in &backends {
+        let result = state
+            .client
+            .get(format!("{}/v1/models", backend.url))
+            .header("Authorization", format!("Bearer {}", backend.api_key))
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await;
+
+        match result {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(bytes) = resp.bytes().await {
+                    if let Ok(json) = serde_json::from_slice::<Value>(&bytes) {
+                        if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
+                            for item in data {
+                                let id = item
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                if seen_ids.insert(id) {
+                                    all_data.push(item.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(resp) => {
+                warn!(url = %backend.url, status = resp.status().as_u16(), "models fanout: backend error");
+            }
+            Err(e) => {
+                warn!(url = %backend.url, error = %e, "models fanout: backend unreachable");
+            }
+        }
+    }
+
+    Ok(Json(serde_json::json!({"object": "list", "data": all_data})))
 }
 
 /// POST /v1/chat/completions
@@ -275,19 +298,28 @@ async fn proxy_request(
         return Err(GatewayError::QuotaExceeded);
     }
 
-    // Rewrite model name to the served model — but leave LoRA aliases untouched
-    // so vLLM routes to the correct adapter.
+    // ── Backend selection ────────────────────────────────────────────────────
+    let backend = state
+        .backend_router
+        .select(&model)
+        .ok_or_else(|| GatewayError::UpstreamError(
+            format!("no available backend for model '{}'", model),
+        ))?;
+
+    // ── Model rewrite: honour LoRA aliases; otherwise use backend's served name ──
     if !state.config.lora_aliases.contains(&model) {
-        body["model"] = Value::String(state.config.served_model_name.clone());
+        if let Some(ref served_name) = backend.served_model_name {
+            body["model"] = Value::String(served_name.clone());
+        }
     }
 
     state.metrics.active_requests.inc();
     state.metrics.inflight_requests.inc();
 
     let result = if stream {
-        stream_proxy(state.clone(), api_key, body, &model, path).await
+        stream_proxy(state.clone(), api_key, body, &model, path, backend).await
     } else {
-        sync_proxy(state.clone(), api_key, body, &model, path).await
+        sync_proxy(state.clone(), api_key, body, &model, path, backend).await
     };
 
     state.metrics.active_requests.dec();
@@ -304,25 +336,23 @@ async fn sync_proxy(
     body: Value,
     model: &str,
     path: &str,
+    backend: Arc<Backend>,
 ) -> Result<Response, GatewayError> {
     let start = Instant::now();
 
-    state.circuit_breaker.before_call()?;
+    backend.circuit_breaker.before_call()?;
 
-    let upstream_url = format!("{}{}", state.config.vllm_url, path);
+    let upstream_url = format!("{}{}", backend.url, path);
 
     let resp = state
         .client
         .post(&upstream_url)
-        .header(
-            "Authorization",
-            format!("Bearer {}", state.config.vllm_api_key),
-        )
+        .header("Authorization", format!("Bearer {}", backend.api_key))
         .json(&body)
         .send()
         .await
         .map_err(|e| {
-            state.circuit_breaker.on_failure();
+            backend.circuit_breaker.on_failure();
             if e.is_timeout() {
                 GatewayError::UpstreamTimeout
             } else {
@@ -334,7 +364,7 @@ async fn sync_proxy(
     let duration = start.elapsed().as_secs_f64();
 
     if status.is_server_error() {
-        state.circuit_breaker.on_failure();
+        backend.circuit_breaker.on_failure();
         state
             .metrics
             .upstream_errors
@@ -342,9 +372,9 @@ async fn sync_proxy(
                 status_code: status.as_str().to_string(),
             })
             .inc_by(1);
-        warn!(status = status.as_u16(), "upstream error");
+        warn!(status = status.as_u16(), url = %backend.url, "upstream error");
     } else {
-        state.circuit_breaker.on_success();
+        backend.circuit_breaker.on_success();
     }
 
     let body_bytes = resp
@@ -392,18 +422,14 @@ async fn sync_proxy(
         state
             .metrics
             .tokens_prompted
-            .get_or_create(&ModelLabel {
-                model: model.to_string(),
-            })
+            .get_or_create(&ModelLabel { model: model.to_string() })
             .inc_by(prompt_tokens);
     }
     if completion_tokens > 0 {
         state
             .metrics
             .tokens_generated
-            .get_or_create(&ModelLabel {
-                model: model.to_string(),
-            })
+            .get_or_create(&ModelLabel { model: model.to_string() })
             .inc_by(completion_tokens);
     }
 
@@ -412,13 +438,12 @@ async fn sync_proxy(
         duration_ms = (duration * 1000.0) as u64,
         prompt_tokens,
         completion_tokens,
+        backend = %backend.url,
         "request complete"
     );
 
     if prompt_tokens > 0 || completion_tokens > 0 {
-        state
-            .quota
-            .add_tokens(&api_key, prompt_tokens, completion_tokens);
+        state.quota.add_tokens(&api_key, prompt_tokens, completion_tokens);
     }
 
     let axum_status =
@@ -439,17 +464,16 @@ async fn stream_proxy(
     mut body: Value,
     model: &str,
     path: &str,
+    backend: Arc<Backend>,
 ) -> Result<Response, GatewayError> {
     let start = Instant::now();
     body["stream"] = Value::Bool(true);
-    // Ask vLLM to append a final usage chunk so we get exact token counts
-    // instead of relying on whitespace approximation.
+    // Ask vLLM to append a final usage chunk so we get exact token counts.
     body["stream_options"] = serde_json::json!({"include_usage": true});
 
-    // Check circuit breaker before spawning the background task.
-    state.circuit_breaker.before_call()?;
+    backend.circuit_breaker.before_call()?;
 
-    let upstream_url = format!("{}{}", state.config.vllm_url, path);
+    let upstream_url = format!("{}{}", backend.url, path);
     let model = model.to_string();
     let path_str = path.to_string();
 
@@ -462,10 +486,7 @@ async fn stream_proxy(
             let resp_result = state
                 .client
                 .post(&upstream_url)
-                .header(
-                    "Authorization",
-                    format!("Bearer {}", state.config.vllm_api_key),
-                )
+                .header("Authorization", format!("Bearer {}", backend.api_key))
                 .json(&body)
                 .send()
                 .await;
@@ -473,7 +494,7 @@ async fn stream_proxy(
             let resp = match resp_result {
                 Ok(r) => r,
                 Err(e) => {
-                    state.circuit_breaker.on_failure();
+                    backend.circuit_breaker.on_failure();
                     let msg = if e.is_timeout() {
                         "upstream timeout"
                     } else {
@@ -492,7 +513,7 @@ async fn stream_proxy(
             let status = resp.status();
 
             if status.is_server_error() {
-                state.circuit_breaker.on_failure();
+                backend.circuit_breaker.on_failure();
                 state
                     .metrics
                     .upstream_errors
@@ -506,13 +527,12 @@ async fn stream_proxy(
                 return;
             }
 
-            state.circuit_breaker.on_success();
+            backend.circuit_breaker.on_success();
 
             let mut byte_stream = resp.bytes_stream();
             let mut line_buf: Vec<u8> = Vec::new();
             let mut first_token = true;
             let mut ttft = 0f64;
-            // Exact counts from vLLM's usage chunk (stream_options.include_usage).
             let mut exact_prompt_tokens: u64 = 0;
             let mut exact_completion_tokens: u64 = 0;
 
@@ -527,7 +547,6 @@ async fn stream_proxy(
 
                 line_buf.extend_from_slice(&chunk);
 
-                // Drain complete `\n`-terminated lines from the buffer
                 loop {
                     match line_buf.iter().position(|&b| b == b'\n') {
                         None => break,
@@ -545,7 +564,6 @@ async fn stream_proxy(
                                 if let Ok(chunk_json) =
                                     serde_json::from_str::<Value>(&line[6..])
                                 {
-                                    // Measure TTFT on first chunk that carries delta content.
                                     if first_token
                                         && chunk_json
                                             .pointer("/choices/0/delta/content")
@@ -555,16 +573,12 @@ async fn stream_proxy(
                                         state
                                             .metrics
                                             .ttft
-                                            .get_or_create(&ModelLabel {
-                                                model: model.clone(),
-                                            })
+                                            .get_or_create(&ModelLabel { model: model.clone() })
                                             .observe(ttft);
                                         info!(ttft_ms = (ttft * 1000.0) as u64, "first token");
                                         first_token = false;
                                     }
 
-                                    // Capture exact token counts from the usage chunk
-                                    // vLLM sends when stream_options.include_usage = true.
                                     if let Some(usage) = chunk_json.get("usage") {
                                         if let Some(p) = usage
                                             .get("prompt_tokens")
@@ -582,7 +596,6 @@ async fn stream_proxy(
                                 }
                             }
 
-                            // Forward as SSE (double newline separator)
                             let sse = format!("{}\n\n", line);
                             if tx.send(Ok(Bytes::from(sse))).await.is_err() {
                                 return; // client disconnected
@@ -599,18 +612,14 @@ async fn stream_proxy(
                 state
                     .metrics
                     .tokens_generated
-                    .get_or_create(&ModelLabel {
-                        model: model.clone(),
-                    })
+                    .get_or_create(&ModelLabel { model: model.clone() })
                     .inc_by(exact_completion_tokens);
             }
             if exact_prompt_tokens > 0 {
                 state
                     .metrics
                     .tokens_prompted
-                    .get_or_create(&ModelLabel {
-                        model: model.clone(),
-                    })
+                    .get_or_create(&ModelLabel { model: model.clone() })
                     .inc_by(exact_prompt_tokens);
             }
 
@@ -644,6 +653,7 @@ async fn stream_proxy(
                     0
                 },
                 ttft_ms = (ttft * 1000.0) as u64,
+                backend = %backend.url,
                 "stream complete"
             );
 
@@ -668,7 +678,8 @@ async fn stream_proxy(
 
 // ── Embeddings ───────────────────────────────────────────────────────────────
 
-/// POST /v1/embeddings — auth + rate limit + quota; proxies to vLLM as-is.
+/// POST /v1/embeddings — auth + rate limit + quota; proxies to the backend that
+/// serves the requested model (no model-name rewrite).
 pub async fn embeddings_handler(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -695,7 +706,7 @@ async fn proxy_post_simple(
         return Err(GatewayError::RateLimited);
     }
 
-    // Per-key RPM + daily limit (same logic as proxy_request)
+    // Per-key RPM + daily limit
     let key_hash = sha256_hex(&api_key);
     let key_meta = state.key_store.lookup(&key_hash);
     if let Some(ref meta) = key_meta {
@@ -720,22 +731,27 @@ async fn proxy_post_simple(
         .unwrap_or(&state.config.served_model_name)
         .to_string();
 
-    state.circuit_breaker.before_call()?;
+    // Select backend — embeddings endpoints route by model name, no rewrite
+    let backend = state
+        .backend_router
+        .select(&model)
+        .ok_or_else(|| GatewayError::UpstreamError(
+            format!("no available backend for model '{}'", model),
+        ))?;
+
+    backend.circuit_breaker.before_call()?;
     let start = Instant::now();
 
-    let upstream_url = format!("{}{}", state.config.vllm_url, path);
+    let upstream_url = format!("{}{}", backend.url, path);
     let resp = state
         .client
         .post(&upstream_url)
-        .header(
-            "Authorization",
-            format!("Bearer {}", state.config.vllm_api_key),
-        )
+        .header("Authorization", format!("Bearer {}", backend.api_key))
         .json(&body)
         .send()
         .await
         .map_err(|e| {
-            state.circuit_breaker.on_failure();
+            backend.circuit_breaker.on_failure();
             if e.is_timeout() {
                 GatewayError::UpstreamTimeout
             } else {
@@ -747,9 +763,9 @@ async fn proxy_post_simple(
     let duration = start.elapsed().as_secs_f64();
 
     if status.is_server_error() {
-        state.circuit_breaker.on_failure();
+        backend.circuit_breaker.on_failure();
     } else {
-        state.circuit_breaker.on_success();
+        backend.circuit_breaker.on_success();
     }
 
     let body_bytes = resp
@@ -767,9 +783,7 @@ async fn proxy_post_simple(
         state
             .metrics
             .tokens_prompted
-            .get_or_create(&ModelLabel {
-                model: model.clone(),
-            })
+            .get_or_create(&ModelLabel { model: model.clone() })
             .inc_by(prompt_tokens);
     }
 
@@ -811,7 +825,7 @@ async fn proxy_post_simple(
 
 // ── Tokenize / Detokenize ─────────────────────────────────────────────────────
 
-/// POST /v1/tokenize — auth-gated passthrough to vLLM /tokenize (no quota).
+/// POST /v1/tokenize — auth-gated passthrough to primary backend /tokenize (no quota).
 pub async fn tokenize_handler(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -821,7 +835,7 @@ pub async fn tokenize_handler(
     passthrough_post(state, addr.ip(), body, "/tokenize").await
 }
 
-/// POST /v1/detokenize — auth-gated passthrough to vLLM /detokenize (no quota).
+/// POST /v1/detokenize — auth-gated passthrough to primary backend /detokenize (no quota).
 pub async fn detokenize_handler(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -831,7 +845,7 @@ pub async fn detokenize_handler(
     passthrough_post(state, addr.ip(), body, "/detokenize").await
 }
 
-/// Auth + rate-limit passthrough — rewrites model name, no quota tracking.
+/// Auth + rate-limit passthrough to the primary backend — rewrites model name, no quota.
 async fn passthrough_post(
     state: Arc<AppState>,
     client_ip: std::net::IpAddr,
@@ -846,19 +860,23 @@ async fn passthrough_post(
         return Err(GatewayError::RateLimited);
     }
 
-    // Rewrite model to served_model_name so vLLM uses the right tokenizer.
+    let backend = state
+        .backend_router
+        .primary()
+        .ok_or_else(|| GatewayError::UpstreamError("no backends configured".into()))?;
+
+    // Rewrite model to the backend's served name so vLLM uses the right tokenizer.
     let mut body: Value = serde_json::from_slice(&raw_body)
         .map_err(|e| GatewayError::BadRequest(e.to_string()))?;
-    body["model"] = Value::String(state.config.served_model_name.clone());
+    if let Some(ref served_name) = backend.served_model_name {
+        body["model"] = Value::String(served_name.clone());
+    }
 
-    let upstream_url = format!("{}{}", state.config.vllm_url, vllm_path);
+    let upstream_url = format!("{}{}", backend.url, vllm_path);
     let resp = state
         .client
         .post(&upstream_url)
-        .header(
-            "Authorization",
-            format!("Bearer {}", state.config.vllm_api_key),
-        )
+        .header("Authorization", format!("Bearer {}", backend.api_key))
         .json(&body)
         .send()
         .await

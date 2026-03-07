@@ -330,27 +330,47 @@ async fn batch_worker(batch_id: Uuid, state: Arc<AppState>, pool: PgPool) {
         let mut body = item.body.clone();
         body["stream"] = Value::Bool(false);
 
+        // Route to the appropriate backend by model name.
+        let req_model = body
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&state.config.served_model_name)
+            .to_string();
+
+        let backend = state
+            .backend_router
+            .select(&req_model)
+            .or_else(|| state.backend_router.primary());
+
+        let backend = match backend {
+            Some(b) => b,
+            None => {
+                failed += 1;
+                results.push(serde_json::json!({
+                    "custom_id": item.custom_id,
+                    "status_code": null,
+                    "body": null,
+                    "error": { "message": "no available backend" },
+                }));
+                continue;
+            }
+        };
+
         // Rewrite model for generation endpoints (not embeddings, honour LoRA aliases)
         if item.url != "/v1/embeddings" {
-            let req_model = body
-                .get("model")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
             if !state.config.lora_aliases.contains(&req_model) {
-                body["model"] = Value::String(state.config.served_model_name.clone());
+                if let Some(ref served_name) = backend.served_model_name {
+                    body["model"] = Value::String(served_name.clone());
+                }
             }
         }
 
-        let vllm_url = format!("{}{}", state.config.vllm_url, item.url);
+        let upstream_url = format!("{}{}", backend.url, item.url);
 
         let result = match state
             .client
-            .post(&vllm_url)
-            .header(
-                "Authorization",
-                format!("Bearer {}", state.config.vllm_api_key),
-            )
+            .post(&upstream_url)
+            .header("Authorization", format!("Bearer {}", backend.api_key))
             .json(&body)
             .send()
             .await
